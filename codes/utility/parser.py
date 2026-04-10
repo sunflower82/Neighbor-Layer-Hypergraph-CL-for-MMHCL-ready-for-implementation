@@ -221,11 +221,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dirichlet_weight', type=float, default=0.1,
                         help='Initial weight for the Dirichlet energy regularisation term.')
 
-    # Expanded projector for u2u branch (TEX §4.2)
-    parser.add_argument('--projector_hidden_dim', type=int, default=256,
-                        help='Hidden dimension of the expanded projector MLP (u2u branch).')
-    parser.add_argument('--projector_out_dim', type=int, default=128,
-                        help='Output dimension of the expanded projector MLP (u2u branch).')
+    # Expanded projector for u2u branch (TEX §4.4)
+    # TEX requires 64→2048→8192 to resolve the dimensionality paradox of Barlow Twins.
+    parser.add_argument('--projector_hidden_dim', type=int, default=2048,
+                        help='Hidden dimension of the expanded projector MLP (u2u branch). '
+                             'TEX §4.4 requires 2048 for effective Barlow Twins cross-correlation.')
+    parser.add_argument('--projector_out_dim', type=int, default=8192,
+                        help='Output dimension of the expanded projector MLP (u2u branch). '
+                             'TEX §4.4 requires 8192 for the high-dimensional projection space.')
 
     # WEMAManager — dynamic EMA similarity weights (TEX §4.2)
     parser.add_argument('--w_ema_alpha', type=float, default=0.9,
