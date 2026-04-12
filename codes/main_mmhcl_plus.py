@@ -257,6 +257,37 @@ def sparse_dirichlet_energy(emb: torch.Tensor, adj: torch.Tensor) -> torch.Tenso
     return ((emb * emb).sum() - (emb * adj_emb).sum()) / n
 
 
+def _sparse_dirichlet_energy_batch(
+    emb: torch.Tensor,
+    adj: torch.Tensor,
+    batch_idx: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Mini-batch Dirichlet energy (TEX §3.3, Corollary 1):
+
+        tr( E_B^T (I − Θ) E_B ) / B
+
+    where E_B = emb[batch_idx].  The trace is approximated by subsampling
+    only the rows corresponding to `batch_idx` from the result of (Θ @ E),
+    reducing the per-batch cost to O(B · d) for the trace evaluation while
+    the sparse propagation remains O(nnz · d).  This matches the design
+    intent: ``yielding a cost of O(B · d̄_v) per batch`` (TEX §3.3).
+
+    Args:
+        emb:       [N, d] full embedding matrix (on GPU).
+        adj:       [N, N] sparse normalised propagation operator Θ (on GPU).
+        batch_idx: [B] LongTensor of node indices for the current mini-batch
+                   (must be on the same device as emb).
+
+    Returns:
+        Scalar Dirichlet energy for the mini-batch.
+    """
+    E_batch = emb[batch_idx]                                     # [B, d]
+    adj_emb_batch = torch.sparse.mm(adj, emb)[batch_idx]        # [B, d]
+    n_batch = batch_idx.size(0)
+    return ((E_batch * E_batch).sum() - (E_batch * adj_emb_batch).sum()) / n_batch
+
+
 # ===========================================================================
 #  MMHCLPlusTrainer
 # ===========================================================================
@@ -621,10 +652,21 @@ class MMHCLPlusTrainer:
                         + soft_byol_alignment(uu_final, u_bip_t)
                     )
 
-                    # ── Dirichlet energy regularisation ───────────────────────
+                    # ── Dirichlet energy regularisation (mini-batch) ──────────
+                    # TEX §3.3 Corollary 1: subsample rows for E_B corresponding
+                    # to the current batch nodes, reducing the trace cost from
+                    # O(N·d) to O(B·d).  batch_idx tensors must be on device.
+                    item_batch_idx = item_t                               # [B_i], already on device
+                    user_batch_idx = torch.tensor(
+                        users, dtype=torch.long, device=device
+                    )                                                     # [B_u]
                     batch_dir = (
-                        sparse_dirichlet_energy(ii_final, self.Item_mat)
-                        + sparse_dirichlet_energy(uu_final, self.User_mat)
+                        _sparse_dirichlet_energy_batch(
+                            ii_final, self.Item_mat, item_batch_idx
+                        )
+                        + _sparse_dirichlet_energy_batch(
+                            uu_final, self.User_mat, user_batch_idx
+                        )
                     )
 
                     # ── Real GradNorm balanced combination ───────────────────

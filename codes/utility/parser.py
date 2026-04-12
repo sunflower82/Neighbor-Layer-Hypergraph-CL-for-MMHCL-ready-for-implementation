@@ -189,9 +189,11 @@ def parse_args() -> argparse.Namespace:
     # =====================================================================
 
     # Warmup & temperature schedule (TEX §4.3–4.4)
-    parser.add_argument('--warmup_epochs', type=int, default=0,
+    parser.add_argument('--warmup_epochs', type=int, default=10,
                         help='Epochs to run BPR-only warmup before enabling CL losses. '
-                             '0 = no warmup (CL from epoch 0).')
+                             'TEX §4.4 specifies 10 warmup epochs so BPR can establish '
+                             'a reasonable embedding space before contrastive objectives '
+                             'are applied, preventing representation collapse early in training.')
     parser.add_argument('--tau_max', type=float, default=0.5,
                         help='Initial (maximum) contrastive temperature for i2i InfoNCE. '
                              'Anneals toward tau_min over training.')
