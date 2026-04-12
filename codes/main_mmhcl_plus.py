@@ -583,7 +583,11 @@ class MMHCLPlusTrainer:
                         if soft_w_u.size(0) != len(users):
                             soft_w_u = None  # safety guard
 
-                    u_pairs = build_neighbor_layer_pairs(uu_layers)
+                    # max_hops=2 enforces the theoretical bound g ≤ 2 from TEX
+                    # Corollary 1: over-smoothing risk grows exponentially beyond
+                    # layer 2 on hypergraphs, so we restrict CL pairs to the
+                    # shallow portion of the network (l=0→1 and l=1→2 only).
+                    u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=2)
                     u2u_terms: list[torch.Tensor] = []
                     for h_l, h_lp1 in u_pairs:
                         z1 = self.projector(h_l[users])
@@ -602,7 +606,10 @@ class MMHCLPlusTrainer:
                     )
 
                     # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
-                    i_pairs = build_neighbor_layer_pairs(ii_layers)
+                    # max_hops=2 mirrors the u2u constraint; with Item_layers=2 the
+                    # list naturally has 2 pairs, so this is a no-op in practice but
+                    # ensures correctness if Item_layers is increased in future runs.
+                    i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=2)
                     i2i_terms: list[torch.Tensor] = []
                     item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
 

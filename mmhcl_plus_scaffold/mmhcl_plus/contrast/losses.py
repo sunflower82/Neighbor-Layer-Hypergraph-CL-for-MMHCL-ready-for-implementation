@@ -89,9 +89,14 @@ def barlow_twins_loss(
     # Cross-correlation matrix  [D, D]
     c = torch.mm(z1.T, z2) / z1.size(0)
 
+    D = c.size(0)  # projection dimension (= 8192 per TEX §4.4)
     on_diag = torch.diagonal(c).add(-1).pow(2).sum()
     off_diag_term = off_diagonal(c).pow(2).sum()
-    return on_diag + lambd * off_diag_term
+    # Divide by D to normalise the loss scale (audit recommendation):
+    # Without normalisation the raw Barlow Twins sum is O(D) ≈ 8192×BPR,
+    # creating a ~5000× scale gap that impairs GradNorm convergence early
+    # in training.  Dividing by D brings the loss into a comparable range.
+    return (on_diag + lambd * off_diag_term) / D
 
 
 # ---------------------------------------------------------------------------
