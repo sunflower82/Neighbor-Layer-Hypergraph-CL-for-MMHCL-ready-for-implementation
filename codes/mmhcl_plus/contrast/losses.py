@@ -31,15 +31,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Global architectural constant (TEX §4.4)
-# ---------------------------------------------------------------------------
-# The expanded projector maps d=64 → 2048 → BARLOW_PROJ_DIM so that the
-# Barlow Twins cross-correlation matrix C ∈ ℝ^{D×D} has enough capacity to
-# decorrelate all embedding dimensions.  This constant is also used to
-# normalise the loss scale: without dividing by D the raw sum over D²
-# entries (~67 M at D=8192) is O(D) ≈ 8192× larger than BPR (~0.1–0.6).
-BARLOW_PROJ_DIM: int = 8192
+from mmhcl_plus.config import BARLOW_PROJ_DIM
 
 
 # ---------------------------------------------------------------------------

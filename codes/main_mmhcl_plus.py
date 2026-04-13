@@ -2,8 +2,8 @@
 main_mmhcl_plus.py — MMHCL+ (Neighbor-Layer Hypergraph CL) Training Script
 ============================================================================
 
-Full implementation of the MMHCL+ architecture (revision43), integrating all
-modules from the MMHCL+ scaffold (mmhcl_plus_scaffold/):
+Full implementation of the MMHCL+ architecture (revision44), integrating all
+modules from the mmhcl_plus package (codes/mmhcl_plus/):
 
   1. Neighbor-layer contrastive learning pairs (NLGCL+ approach)
        - u2u branch : Barlow Twins between adjacent user-hypergraph layers
@@ -30,7 +30,7 @@ Usage (same CLI interface as main.py, plus new MMHCL+ flags):
 Log format is intentionally identical to main.py so that the notebook's
 results-parsing cells work without modification.
 
-Reference: NLGCL-to-MMHCL-architecture_revision43_full_implementation.tex
+Reference: NLGCL-to-MMHCL-architecture_revision44_full_implementation.tex
 """
 
 from __future__ import annotations
@@ -61,13 +61,7 @@ from Models import MMHCL
 from utility.batch_test import *          # also instantiates global data_generator
 from utility.logging import Logger
 
-# ── MMHCL+ scaffold ───────────────────────────────────────────────────────────
-_SCAFFOLD = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mmhcl_plus_scaffold')
-)
-if _SCAFFOLD not in sys.path:
-    sys.path.insert(0, _SCAFFOLD)
-
+# ── MMHCL+ package (codes/mmhcl_plus/) ────────────────────────────────────────
 from mmhcl_plus.contrast.losses import barlow_twins_loss, chunked_info_nce_loss
 from mmhcl_plus.contrast.soft_byol import soft_byol_alignment
 from mmhcl_plus.contrast.neighbor_pairs import build_neighbor_layer_pairs

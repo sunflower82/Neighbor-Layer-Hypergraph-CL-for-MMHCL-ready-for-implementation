@@ -3,12 +3,18 @@ from types import SimpleNamespace
 from typing import List, Dict, Any
 import yaml
 
+# ── Global architectural constant (TEX §4.4) ──────────────────────────────
+# Single source of truth for the Barlow Twins projection dimension D.
+# Referenced by losses.py (normalize_by_dim), projector.py (out_dim default),
+# and ModelConfig below.  Changing this value propagates everywhere.
+BARLOW_PROJ_DIM: int = 8192
+
 @dataclass
 class ModelConfig:
     in_dim: int = 64
     hidden_dim: int = 64
     projector_hidden_dim: int = 2048
-    projector_out_dim: int = 8192
+    projector_out_dim: int = BARLOW_PROJ_DIM
     n_layers: int = 3
     max_g_layers: int = 2
     fusion_hidden_dim: int = 128

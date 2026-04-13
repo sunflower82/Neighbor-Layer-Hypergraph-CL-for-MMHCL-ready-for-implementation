@@ -1,10 +1,6 @@
 import torch.nn as nn
 
-# TEX §4.4: expanded projector output dimension.
-# Must match BARLOW_PROJ_DIM in mmhcl_plus/contrast/losses.py.
-# Declared here as a module-level constant so that callers (parser.py,
-# config.py, train_mmhcl_plus.py) can reference it without hard-coding 8192.
-BARLOW_PROJ_DIM: int = 8192
+from mmhcl_plus.config import BARLOW_PROJ_DIM
 
 
 class ExpandedProjector(nn.Module):
