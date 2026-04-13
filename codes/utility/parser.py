@@ -251,10 +251,15 @@ def parse_args() -> argparse.Namespace:
                              'xi <- beta*xi + (1-beta)*theta. Higher = slower teacher update.')
 
     # Profiling-guided activation checkpointing (TEX §4.3, Table 2)
-    parser.add_argument('--checkpoint_threshold', type=int, default=1,
+    # Default is -1 (disabled) per Revision44 spec: "the current benchmark
+    # configuration keeps this option disabled because VRAM headroom is
+    # sufficient on RTX 5090 (32 GB)".  Set to 1 only for ablation studies
+    # or on GPUs with limited VRAM where the +12% time overhead is acceptable.
+    parser.add_argument('--checkpoint_threshold', type=int, default=-1,
                         help='Checkpoint hypergraph layers from this index onward '
                              '(0-indexed). Layers < threshold are cached for CL pairs; '
                              'layers >= threshold are recomputed during backward. '
-                             '-1 disables checkpointing entirely.')
+                             '-1 (default) disables checkpointing entirely, matching '
+                             'the Revision44 benchmark configuration.')
 
     return parser.parse_args()

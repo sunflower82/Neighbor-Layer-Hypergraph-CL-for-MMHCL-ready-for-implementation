@@ -31,6 +31,16 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+# ---------------------------------------------------------------------------
+# Global architectural constant (TEX §4.4)
+# ---------------------------------------------------------------------------
+# The expanded projector maps d=64 → 2048 → BARLOW_PROJ_DIM so that the
+# Barlow Twins cross-correlation matrix C ∈ ℝ^{D×D} has enough capacity to
+# decorrelate all embedding dimensions.  This constant is also used to
+# normalise the loss scale: without dividing by D the raw sum over D²
+# entries (~67 M at D=8192) is O(D) ≈ 8192× larger than BPR (~0.1–0.6).
+BARLOW_PROJ_DIM: int = 8192
+
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -52,6 +62,7 @@ def barlow_twins_loss(
     z2: torch.Tensor,
     lambd: float = 5e-3,
     soft_weights: torch.Tensor | None = None,
+    normalize_by_dim: bool = True,
 ) -> torch.Tensor:
     """
     Barlow Twins loss with optional per-sample soft weighting (TEX §4.4).
@@ -61,15 +72,22 @@ def barlow_twins_loss(
     semantically similar pairs (high W_ema[i, i+]) and down-weights noisy ones,
     implementing Adaptive Sample Weighting (ASW) from NLGCL+ §3.3.
 
-    The expanded projector (d=64 → D=8192) applied upstream ensures that the
-    cross-correlation matrix is well-conditioned despite the small embedding dim.
+    The expanded projector (d=64 → D=BARLOW_PROJ_DIM=8192) applied upstream
+    ensures the cross-correlation matrix is well-conditioned.
 
     Args:
-        z1, z2:       [B, D] projected embeddings (after ExpandedProjector).
-        lambd:        Off-diagonal penalty coefficient.
-        soft_weights: Optional [B] float tensor of per-sample importance weights.
-                      Values are L1-normalised internally so the total scale of
-                      the loss is preserved regardless of how weights are produced.
+        z1, z2:          [B, D] projected embeddings (after ExpandedProjector).
+        lambd:           Off-diagonal penalty coefficient λ (default 5e-3).
+        soft_weights:    Optional [B] float tensor of per-sample importance
+                         weights.  L1-normalised internally to preserve total
+                         loss scale regardless of weight distribution.
+        normalize_by_dim: If True (default), divide the final loss by
+                         BARLOW_PROJ_DIM (= D = 8192).  This removes the O(D)
+                         scale inflation caused by summing D² cross-correlation
+                         entries, bringing u2u into the same order of magnitude
+                         as BPR (~0.08–0.35 vs ~0.13) so GradNorm converges
+                         without fighting a ~5000× scale gap.
+                         Set to False only for ablation / backward-compat tests.
 
     Returns:
         Scalar loss.
@@ -89,14 +107,14 @@ def barlow_twins_loss(
     # Cross-correlation matrix  [D, D]
     c = torch.mm(z1.T, z2) / z1.size(0)
 
-    D = c.size(0)  # projection dimension (= 8192 per TEX §4.4)
     on_diag = torch.diagonal(c).add(-1).pow(2).sum()
     off_diag_term = off_diagonal(c).pow(2).sum()
-    # Divide by D to normalise the loss scale (audit recommendation):
-    # Without normalisation the raw Barlow Twins sum is O(D) ≈ 8192×BPR,
-    # creating a ~5000× scale gap that impairs GradNorm convergence early
-    # in training.  Dividing by D brings the loss into a comparable range.
-    return (on_diag + lambd * off_diag_term) / D
+    loss = on_diag + lambd * off_diag_term
+
+    if normalize_by_dim:
+        loss = loss / BARLOW_PROJ_DIM
+
+    return loss
 
 
 # ---------------------------------------------------------------------------
