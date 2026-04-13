@@ -36,7 +36,7 @@ class LossConfig:
     # GradNorm α — higher values enforce stricter balance
     gradnorm_alpha: float = 1.5
     # Per-task loss weights (overridden by GradNorm at runtime)
-    dirichlet_weight: float = 0.1
+    dirichlet_weight: float = 1.0
     bpr_weight: float = 1.0
     u2u_weight: float = 1.0
     i2i_weight: float = 1.0

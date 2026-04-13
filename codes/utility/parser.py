@@ -220,8 +220,15 @@ def parse_args() -> argparse.Namespace:
                         help='Initial weight for the i2i Chunked InfoNCE loss term.')
     parser.add_argument('--align_weight', type=float, default=1.0,
                         help='Initial weight for the soft BYOL cross-view alignment term.')
-    parser.add_argument('--dirichlet_weight', type=float, default=0.1,
-                        help='Initial weight for the Dirichlet energy regularisation term.')
+    # Audit finding: with d=64 and shallow propagation (L=2–3), the raw
+    # mini-batch Dirichlet energy is only ~0.0003–0.00045, which is ~400×
+    # smaller than BPR (~0.13).  The default was 0.1 in earlier revisions,
+    # but that made the regulariser contribution negligible (~0.00003).
+    # Raising to 1.0 gives GradNorm a meaningful signal to work with.
+    parser.add_argument('--dirichlet_weight', type=float, default=1.0,
+                        help='Initial weight for the Dirichlet energy regularisation term. '
+                             'Set higher (1.0–10.0) when the raw energy is very small '
+                             '(< 0.001) so GradNorm can balance it effectively.')
 
     # Expanded projector for u2u branch (TEX §4.4)
     # TEX requires 64→2048→8192 to resolve the dimensionality paradox of Barlow Twins.

@@ -733,6 +733,18 @@ class MMHCLPlusTrainer:
                     wandb.finish(exit_code=1)
                 return 0.0
 
+            # One-time Dirichlet scale diagnostic (first CL epoch)
+            if epoch == args.warmup_epochs and not in_warmup:
+                avg_dir = dir_acc / max(n_batch, 1)
+                avg_bpr = bpr_acc / max(n_batch, 1)
+                ratio = avg_dir / max(avg_bpr, 1e-12)
+                self.logger.logging(
+                    '[DIAG] First CL epoch Dirichlet scale: '
+                    'raw_dir=%.6f  bpr=%.5f  ratio=%.4f  '
+                    '(if ratio < 0.01, consider increasing --dirichlet_weight)'
+                    % (avg_dir, avg_bpr, ratio)
+                )
+
             # W&B training metrics
             if args.use_wandb and wandb is not None:
                 wandb.log({
@@ -743,6 +755,7 @@ class MMHCLPlusTrainer:
                     'train/i2i':  i2i_acc,
                     'train/align': aln_acc,
                     'train/dirichlet': dir_acc,
+                    'train/dirichlet_raw_avg': dir_acc / max(n_batch, 1),
                     'train/tau':  tau,
                     'train/warmup': int(in_warmup),
                     'train/lr':   self.optimizer.param_groups[0]['lr'],
