@@ -5,6 +5,7 @@ Canonical implementations of helpers that were previously duplicated across
 multiple training scripts.  All training entry points should import from here
 rather than defining their own copies.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -57,7 +58,7 @@ def bpr_loss(
     pos_scores = (users * pos_items).sum(dim=1)
     neg_scores = (users * neg_items).sum(dim=1)
 
-    reg = (users ** 2).sum() + (pos_items ** 2).sum() + (neg_items ** 2).sum()
+    reg = (users**2).sum() + (pos_items**2).sum() + (neg_items**2).sum()
     reg = reg / (2.0 * batch_size)
 
     mf_loss = -torch.mean(torch.nn.functional.logsigmoid(pos_scores - neg_scores))

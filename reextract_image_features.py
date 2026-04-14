@@ -6,19 +6,31 @@ The original preprocess script used http:// which is now blocked.
 This script converts to https:// and re-downloads all images.
 """
 
-import json, os, numpy as np, torch, requests
 from io import BytesIO
-from PIL import Image
-from tqdm import tqdm
-from transformers import CLIPProcessor, CLIPModel
-from preprocess_helpers import iter_gzip_jsonlines, select_image_url, clip_image_embeddings
+import json
+import os
 
-BASE     = os.path.join(os.path.dirname(__file__), "data", "Baby")
-META_GZ  = os.path.join(BASE, "meta_Baby.json.gz")
-ITEM2ID  = os.path.join(BASE, "item2id.json")
+import numpy as np
+from PIL import Image
+import requests
+import torch
+from tqdm import tqdm
+from transformers import CLIPModel, CLIPProcessor
+
+from preprocess_helpers import (
+    clip_image_embeddings,
+    iter_gzip_jsonlines,
+    select_image_url,
+)
+
+BASE = os.path.join(os.path.dirname(__file__), "data", "Baby")
+META_GZ = os.path.join(BASE, "meta_Baby.json.gz")
+ITEM2ID = os.path.join(BASE, "item2id.json")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Device: {DEVICE} | GPU: {torch.cuda.get_device_name(0) if DEVICE=='cuda' else 'N/A'}")
+print(
+    f"Device: {DEVICE} | GPU: {torch.cuda.get_device_name(0) if DEVICE == 'cuda' else 'N/A'}"
+)
 
 # Load item ID mapping from prior preprocessing
 with open(ITEM2ID) as f:
@@ -28,7 +40,7 @@ print(f"Items: {NUM_ITEMS:,}")
 
 # Load CLIP model
 print("Loading CLIP ViT-B/32...")
-model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 model.eval()
 print("CLIP model loaded.")
@@ -64,8 +76,8 @@ with torch.no_grad():
         try:
             resp = session.get(url, timeout=5)
             resp.raise_for_status()
-            img  = Image.open(BytesIO(resp.content)).convert("RGB")
-            inp  = processor(images=img, return_tensors="pt").to(DEVICE)
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            inp = processor(images=img, return_tensors="pt").to(DEVICE)
 
             emb = clip_image_embeddings(model, inp)
             image_features[iid] = emb.cpu().numpy().flatten()
@@ -76,8 +88,8 @@ with torch.no_grad():
 out_path = os.path.join(BASE, "image_feat.npy")
 np.save(out_path, image_features)
 
-print(f"\n{'='*60}")
-print(f"Image feature extraction complete")
+print(f"\n{'=' * 60}")
+print("Image feature extraction complete")
 print(f"  Saved : {out_path}")
 print(f"  Shape : {image_features.shape}")
 print(f"  OK    : {ok:,} / {NUM_ITEMS:,}")

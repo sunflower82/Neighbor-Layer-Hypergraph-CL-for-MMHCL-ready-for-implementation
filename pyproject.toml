@@ -11,6 +11,7 @@ exclude = [
     "__pycache__",
     "wandb",
     "*.egg-info",
+    "mmhcl_plus_scaffold",
 ]
 
 [tool.ruff.format]
@@ -29,6 +30,7 @@ select = [
 ignore = [
     "E501",  # line length; formatter wraps where practical
     "E402",  # imports not at top (common in training entrypoints)
+    "UP031",  # legacy printf-style logging; migrate to f-strings incrementally
 ]
 
 # Notebooks are executed cell-by-cell; rules that assume a single module break on .ipynb.
@@ -50,7 +52,7 @@ ignore = [
     "F405",
 ]
 # Package barrels: symbols are re-exported for `from mmhcl_plus.foo import Bar`.
-"mmhcl_plus_scaffold/mmhcl_plus/**/__init__.py" = ["F401"]
+"codes/mmhcl_plus/**/__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
 force-single-line = false

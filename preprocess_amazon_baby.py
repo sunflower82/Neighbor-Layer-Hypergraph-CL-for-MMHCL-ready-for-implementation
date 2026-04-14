@@ -21,32 +21,34 @@ Run from the project root:
   python preprocess_amazon_baby.py
 """
 
-import json
-import os
-import math
-import random
-import numpy as np
-import torch
-import requests
-from io import BytesIO
-from PIL import Image
-from tqdm import tqdm
 from collections import defaultdict
-from transformers import CLIPProcessor, CLIPModel
+from io import BytesIO
+import json
+import math
+import os
+import random
+
+import numpy as np
+from PIL import Image
+import requests
+import torch
+from tqdm import tqdm
+from transformers import CLIPModel, CLIPProcessor
+
 from preprocess_helpers import (
+    clip_image_embeddings,
+    clip_text_embeddings,
     iter_gzip_jsonlines,
     select_image_url,
-    clip_text_embeddings,
-    clip_image_embeddings,
 )
 
 # ===========================================================================
 #  Paths
 # ===========================================================================
 BASE = os.path.join(os.path.dirname(__file__), "data", "Baby")
-REVIEW_GZ  = os.path.join(BASE, "reviews_Baby_5.json.gz")
-META_GZ    = os.path.join(BASE, "meta_Baby.json.gz")
-CORE_DIR   = os.path.join(BASE, "5-core")
+REVIEW_GZ = os.path.join(BASE, "reviews_Baby_5.json.gz")
+META_GZ = os.path.join(BASE, "meta_Baby.json.gz")
+CORE_DIR = os.path.join(BASE, "5-core")
 os.makedirs(CORE_DIR, exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -57,9 +59,9 @@ if DEVICE == "cuda":
 # ===========================================================================
 #  PART 1 — ID mapping and per-user 8:1:1 random split (BM3 protocol)
 # ===========================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print("PART 1: Reading reviews and building ID mappings")
-print("="*60)
+print("=" * 60)
 
 interactions = []
 for d in iter_gzip_jsonlines(REVIEW_GZ):
@@ -73,8 +75,8 @@ print(f"Total interactions read : {len(interactions):,}")
 # Build continuous integer ID mappings (sorted for reproducibility)
 all_users = sorted({r[0] for r in interactions})
 all_items = sorted({r[1] for r in interactions})
-user2id   = {u: i for i, u in enumerate(all_users)}
-item2id   = {v: i for i, v in enumerate(all_items)}
+user2id = {u: i for i, u in enumerate(all_users)}
+item2id = {v: i for i, v in enumerate(all_items)}
 NUM_USERS = len(user2id)
 NUM_ITEMS = len(item2id)
 print(f"Unique users           : {NUM_USERS:,}")
@@ -96,38 +98,40 @@ for reviewer, asin in interactions:
 random.seed(42)
 
 train_dict: dict[str, list[int]] = {}
-val_dict:   dict[str, list[int]] = {}
-test_dict:  dict[str, list[int]] = {}
+val_dict: dict[str, list[int]] = {}
+test_dict: dict[str, list[int]] = {}
 
 for uid in range(NUM_USERS):
     items = user_items[uid][:]
     random.shuffle(items)
     n = len(items)
 
-    n_test  = max(1, math.floor(n * 0.1))
-    n_val   = max(1, math.floor(n * 0.1))
+    n_test = max(1, math.floor(n * 0.1))
+    n_val = max(1, math.floor(n * 0.1))
 
-    test_items  = items[:n_test]
-    val_items   = items[n_test:n_test + n_val]
-    train_items = items[n_test + n_val:]
+    test_items = items[:n_test]
+    val_items = items[n_test : n_test + n_val]
+    train_items = items[n_test + n_val :]
 
     train_dict[str(uid)] = train_items
-    val_dict[str(uid)]   = val_items
-    test_dict[str(uid)]  = test_items
+    val_dict[str(uid)] = val_items
+    test_dict[str(uid)] = test_items
 
 n_train = sum(len(v) for v in train_dict.values())
-n_val   = sum(len(v) for v in val_dict.values())
-n_test  = sum(len(v) for v in test_dict.values())
-total   = n_train + n_val + n_test
-print(f"\nSplit summary:")
-print(f"  Train : {n_train:>7,}  ({100*n_train/total:.1f}%)")
-print(f"  Val   : {n_val:>7,}  ({100*n_val/total:.1f}%)")
-print(f"  Test  : {n_test:>7,}  ({100*n_test/total:.1f}%)")
+n_val = sum(len(v) for v in val_dict.values())
+n_test = sum(len(v) for v in test_dict.values())
+total = n_train + n_val + n_test
+print("\nSplit summary:")
+print(f"  Train : {n_train:>7,}  ({100 * n_train / total:.1f}%)")
+print(f"  Val   : {n_val:>7,}  ({100 * n_val / total:.1f}%)")
+print(f"  Test  : {n_test:>7,}  ({100 * n_test / total:.1f}%)")
 
 # Save JSON files
-for name, data in [("train.json", train_dict),
-                   ("val.json",   val_dict),
-                   ("test.json",  test_dict)]:
+for name, data in [
+    ("train.json", train_dict),
+    ("val.json", val_dict),
+    ("test.json", test_dict),
+]:
     path = os.path.join(CORE_DIR, name)
     with open(path, "w") as f:
         json.dump(data, f)
@@ -138,14 +142,14 @@ with open(os.path.join(BASE, "user2id.json"), "w") as f:
     json.dump(user2id, f)
 with open(os.path.join(BASE, "item2id.json"), "w") as f:
     json.dump(item2id, f)
-print(f"\nID mappings saved to data/Baby/user2id.json and item2id.json")
+print("\nID mappings saved to data/Baby/user2id.json and item2id.json")
 
 # ===========================================================================
 #  PART 2 — Read metadata: build text and image-URL lookup per item
 # ===========================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print("PART 2: Reading metadata")
-print("="*60)
+print("=" * 60)
 
 item_meta: dict[int, dict] = {}
 meta_found = 0
@@ -155,14 +159,14 @@ for d in iter_gzip_jsonlines(META_GZ):
     if asin not in item2id:
         continue
 
-    iid   = item2id[asin]
+    iid = item2id[asin]
     title = d.get("title", "") or ""
-    desc  = d.get("description", "") or ""
+    desc = d.get("description", "") or ""
     if isinstance(desc, list):
         desc = " ".join(str(x) for x in desc)
 
     item_meta[iid] = {
-        "text":      f"{title} {desc}".strip(),
+        "text": f"{title} {desc}".strip(),
         "image_url": select_image_url(d),
     }
     meta_found += 1
@@ -173,28 +177,28 @@ print(f"  Items without metadata (features will be zero): {NUM_ITEMS - meta_foun
 # ===========================================================================
 #  PART 3 — CLIP ViT-B/32 feature extraction
 # ===========================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print("PART 3: Loading CLIP ViT-B/32 model")
-print("="*60)
+print("=" * 60)
 
-model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
+model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
 processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 model.eval()
 print("CLIP model loaded.")
 
 # Allocate output matrices
 image_features = np.zeros((NUM_ITEMS, 512), dtype=np.float32)
-text_features  = np.zeros((NUM_ITEMS, 512), dtype=np.float32)
+text_features = np.zeros((NUM_ITEMS, 512), dtype=np.float32)
 
 # ---- 3a. Batch text encoding ----
-print(f"\nExtracting text features (batch_size=128)...")
+print("\nExtracting text features (batch_size=128)...")
 TEXT_BATCH = 128
 item_ids_list = list(range(NUM_ITEMS))
 
 with torch.no_grad():
     for start in tqdm(range(0, NUM_ITEMS, TEXT_BATCH), desc="Text"):
-        batch_ids  = item_ids_list[start: start + TEXT_BATCH]
-        texts      = []
+        batch_ids = item_ids_list[start : start + TEXT_BATCH]
+        texts = []
         for iid in batch_ids:
             raw = item_meta.get(iid, {}).get("text", "").strip()
             texts.append(raw if raw else "unknown product")
@@ -206,15 +210,15 @@ with torch.no_grad():
             max_length=77,
             padding=True,
         ).to(DEVICE)
-        embs = clip_text_embeddings(model, inputs)         # (B, 512)
-        text_features[start: start + TEXT_BATCH] = embs.cpu().numpy()
+        embs = clip_text_embeddings(model, inputs)  # (B, 512)
+        text_features[start : start + TEXT_BATCH] = embs.cpu().numpy()
 
 np.save(os.path.join(BASE, "text_feat.npy"), text_features)
 print(f"  Saved: data/Baby/text_feat.npy  shape={text_features.shape}")
 
 # ---- 3b. Image encoding (one at a time — handles URL failures gracefully) ----
-print(f"\nExtracting image features (1-by-1, 3s URL timeout)...")
-img_ok   = 0
+print("\nExtracting image features (1-by-1, 3s URL timeout)...")
+img_ok = 0
 img_fail = 0
 
 session = requests.Session()
@@ -229,8 +233,8 @@ with torch.no_grad():
         try:
             resp = session.get(url, timeout=3)
             resp.raise_for_status()
-            img  = Image.open(BytesIO(resp.content)).convert("RGB")
-            inp  = processor(images=img, return_tensors="pt").to(DEVICE)
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            inp = processor(images=img, return_tensors="pt").to(DEVICE)
             emb = clip_image_embeddings(model, inp)
             image_features[iid] = emb.cpu().numpy().flatten()
             img_ok += 1
@@ -245,9 +249,9 @@ print(f"  Images failed/missing: {img_fail:,}  (zero-vectors used)")
 # ===========================================================================
 #  Summary
 # ===========================================================================
-print("\n" + "="*60)
+print("\n" + "=" * 60)
 print("PREPROCESSING COMPLETE")
-print("="*60)
+print("=" * 60)
 print(f"  data/Baby/5-core/train.json  — {n_train:,} interactions")
 print(f"  data/Baby/5-core/val.json    — {n_val:,} interactions")
 print(f"  data/Baby/5-core/test.json   — {n_test:,} interactions")

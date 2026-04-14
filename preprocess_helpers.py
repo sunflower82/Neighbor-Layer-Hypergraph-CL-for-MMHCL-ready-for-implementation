@@ -6,18 +6,20 @@ Consolidates duplicated patterns across:
   - reextract_image_features.py
   - verify_and_fix_text_features.py
 """
+
 from __future__ import annotations
 
+from collections.abc import Iterator
 import gzip
 import json
-from typing import Any, Iterator
+from typing import Any
 
 import torch
-
 
 # ---------------------------------------------------------------------------
 # Gzip JSON-lines parsing (Amazon metadata may use Python-eval format)
 # ---------------------------------------------------------------------------
+
 
 def iter_gzip_jsonlines(path: str) -> Iterator[dict[str, Any]]:
     """Yield parsed dicts from a gzip-compressed JSON-lines file.
@@ -41,6 +43,7 @@ def iter_gzip_jsonlines(path: str) -> Iterator[dict[str, Any]]:
 # Image URL selection (prefer high-res, fall back to imUrl)
 # ---------------------------------------------------------------------------
 
+
 def select_image_url(meta: dict[str, Any], *, force_https: bool = False) -> str:
     """Pick the best image URL from an Amazon metadata record."""
     url = ""
@@ -57,6 +60,7 @@ def select_image_url(meta: dict[str, Any], *, force_https: bool = False) -> str:
 # ---------------------------------------------------------------------------
 # CLIP embedding extraction (compatible with transformers v4 and v5+)
 # ---------------------------------------------------------------------------
+
 
 def clip_text_embeddings(model, inputs) -> torch.Tensor:
     """Extract (B, 512) text embeddings from a CLIP model forward pass."""

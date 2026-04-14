@@ -33,10 +33,10 @@ import torch.nn.functional as F
 
 from mmhcl_plus.config import BARLOW_PROJ_DIM
 
-
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
+
 
 def off_diagonal(x: torch.Tensor) -> torch.Tensor:
     """Return all off-diagonal elements of a square matrix as a 1-D tensor."""
@@ -48,6 +48,7 @@ def off_diagonal(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # Barlow Twins (u2u branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
+
 
 def barlow_twins_loss(
     z1: torch.Tensor,
@@ -113,6 +114,7 @@ def barlow_twins_loss(
 # Chunked InfoNCE (i2i branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
 
+
 def chunked_info_nce_loss(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -153,8 +155,8 @@ def chunked_info_nce_loss(
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        chunk_q = q[start:end]                       # [C, d]
-        logits = chunk_q @ k.T / tau                 # [C, N]
+        chunk_q = q[start:end]  # [C, d]
+        logits = chunk_q @ k.T / tau  # [C, N]
 
         if dynamic_weights is not None:
             # Log-prior correction (adaptive sample weighting)
@@ -171,7 +173,9 @@ def temperature_free_info_nce_loss(
     k: torch.Tensor,
 ) -> torch.Tensor:
     """InfoNCE with τ = 1.0 (temperature-free baseline)."""
-    return chunked_info_nce_loss(q, k, tau=1.0, chunk_size=max(256, min(2048, q.size(0))))
+    return chunked_info_nce_loss(
+        q, k, tau=1.0, chunk_size=max(256, min(2048, q.size(0)))
+    )
 
 
 def info_nce_loss(
@@ -190,6 +194,7 @@ def info_nce_loss(
 # ---------------------------------------------------------------------------
 # BPR loss (main recommendation task)
 # ---------------------------------------------------------------------------
+
 
 def bpr_loss(
     pos_scores: torch.Tensor,
