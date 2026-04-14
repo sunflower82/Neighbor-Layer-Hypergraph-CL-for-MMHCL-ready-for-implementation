@@ -1,0 +1,53 @@
+{
+  "n_runs": 3,
+  "seeds": [
+    1870604991,
+    259996268,
+    1547121478
+  ],
+  "config": {
+    "batch_size": 1024,
+    "max_epochs": 250,
+    "lr": 0.0001,
+    "early_stopping_patience": 30,
+    "early_stopping_min_epochs": 75,
+    "wandb_project": "snips-local-mmhcl-plus-baby"
+  },
+  "statistics": {
+    "recall@20": {
+      "mean": 0.08678500666666666,
+      "std": 0.00046666300905709283
+    },
+    "precision@20": {
+      "mean": 0.0045658700000000005,
+      "std": 1.8936456901965602e-05
+    },
+    "ndcg@20": {
+      "mean": 0.03863474666666667,
+      "std": 0.0004233997655749111
+    }
+  },
+  "individual_results": [
+    {
+      "seed": 1870604991,
+      "recall@20": 0.08624303,
+      "precision@20": 0.00454358,
+      "ndcg@20": 0.03862075,
+      "log_file": "../Baby/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=1870604991_/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=1870604991_.txt"
+    },
+    {
+      "seed": 259996268,
+      "recall@20": 0.08738212,
+      "precision@20": 0.00458987,
+      "ndcg@20": 0.03916016,
+      "log_file": "../Baby/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=259996268_/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=259996268_.txt"
+    },
+    {
+      "seed": 1547121478,
+      "recall@20": 0.08672987,
+      "precision@20": 0.00456416,
+      "ndcg@20": 0.03812333,
+      "log_file": "../Baby/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=1547121478_/uu_ii=3_2_0.03_0.07_topk=5_t=0.6_regs=0.001_dim=64_seed=1547121478_.txt"
+    }
+  ]
+}
