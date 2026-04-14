@@ -453,7 +453,7 @@ class MMHCLPlusTrainer:
             winit: dict[str, Any] = {
                 "project": args.wandb_project,
                 "config": wconfig,
-                "reinit": True,
+                "finish_previous": True,
             }
             if args.wandb_entity:
                 winit["entity"] = args.wandb_entity

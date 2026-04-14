@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,9 @@ import torch.nn.functional as F
 
 def _maybe_torch_compile(fn):
     if os.environ.get("MMHCL_DISABLE_TORCH_COMPILE", "").strip():
+        return fn
+    # Triton (required by torch.compile inductor backend) is not available on Windows
+    if sys.platform == "win32":
         return fn
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
