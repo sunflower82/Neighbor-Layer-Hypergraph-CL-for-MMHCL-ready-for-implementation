@@ -1,3 +1,4 @@
+from .build_laplacian import build_hypergraph_laplacian
 from .dynamic_ema_weights import (
     WEMAManager,
     build_item_wema,

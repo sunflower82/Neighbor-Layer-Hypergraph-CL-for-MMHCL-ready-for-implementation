@@ -105,7 +105,7 @@ def barlow_twins_loss(
     loss = on_diag + lambd * off_diag_term
 
     if normalize_by_dim:
-        loss = loss / BARLOW_PROJ_DIM
+        loss = loss / z1.size(-1)
 
     return loss
 

@@ -248,14 +248,8 @@ class TwoStageTrainer:
         # ----------------------------------------------------------------
         # Aggregation via GradNorm
         # ----------------------------------------------------------------
-        weighted_losses = [
-            self.cfg.loss.bpr_weight * loss_bpr,
-            self.cfg.loss.u2u_weight * loss_u,
-            self.cfg.loss.i2i_weight * loss_i,
-            self.cfg.loss.align_weight * loss_align,
-            self.cfg.loss.dirichlet_weight * loss_dir,
-        ]
-        total, grad_weights = self.balancer.combine(weighted_losses)
+        raw_losses = [loss_bpr, loss_u, loss_i, loss_align, loss_dir]
+        total, grad_weights = self.balancer.combine(raw_losses)
 
         # ----------------------------------------------------------------
         # Backward + grad clip (report Opt. 6) + parameter update
