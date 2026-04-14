@@ -22,7 +22,7 @@ ranklist_by_sorted() in batch_test.py.
 
 from __future__ import annotations
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -80,7 +80,7 @@ def average_precision(r: Sequence[int], cut: int) -> float:
     r_arr: npt.NDArray[np.floating] = np.asarray(r)
     out: list[float] = [precision_at_k(r_arr, k + 1) for k in range(cut) if r_arr[k]]
     if not out:
-        return 0.
+        return 0.0
     return float(np.sum(out) / float(min(cut, np.sum(r_arr))))
 
 
@@ -97,7 +97,7 @@ def mean_average_precision(rs: list[Sequence[int]]) -> float:
     return float(np.mean([average_precision(r) for r in rs]))
 
 
-def dcg_at_k(r: Sequence[Union[int, float]], k: int, method: int = 1) -> float:
+def dcg_at_k(r: Sequence[int | float], k: int, method: int = 1) -> float:
     """
     Discounted Cumulative Gain (DCG@K).
 
@@ -119,15 +119,17 @@ def dcg_at_k(r: Sequence[Union[int, float]], k: int, method: int = 1) -> float:
     r_arr: npt.NDArray[np.floating] = np.asfarray(r)[:k]
     if r_arr.size:
         if method == 0:
-            return float(r_arr[0] + np.sum(r_arr[1:] / np.log2(np.arange(2, r_arr.size + 1))))
+            return float(
+                r_arr[0] + np.sum(r_arr[1:] / np.log2(np.arange(2, r_arr.size + 1)))
+            )
         elif method == 1:
             return float(np.sum(r_arr / np.log2(np.arange(2, r_arr.size + 2))))
         else:
-            raise ValueError('method must be 0 or 1.')
-    return 0.
+            raise ValueError("method must be 0 or 1.")
+    return 0.0
 
 
-def ndcg_at_k(r: Sequence[Union[int, float]], k: int, method: int = 1) -> float:
+def ndcg_at_k(r: Sequence[int | float], k: int, method: int = 1) -> float:
     """
     Normalised Discounted Cumulative Gain (NDCG@K).
 
@@ -149,11 +151,11 @@ def ndcg_at_k(r: Sequence[Union[int, float]], k: int, method: int = 1) -> float:
     """
     dcg_max: float = dcg_at_k(sorted(r, reverse=True), k, method)
     if not dcg_max:
-        return 0.
+        return 0.0
     return dcg_at_k(r, k, method) / dcg_max
 
 
-def recall_at_k(r: Sequence[Union[int, float]], k: int, all_pos_num: int) -> float:
+def recall_at_k(r: Sequence[int | float], k: int, all_pos_num: int) -> float:
     """
     Recall@K: fraction of all positive items that appear in the top-K.
 
@@ -167,12 +169,12 @@ def recall_at_k(r: Sequence[Union[int, float]], k: int, all_pos_num: int) -> flo
     """
     r_arr: npt.NDArray[np.floating] = np.asfarray(r)[:k]
     if all_pos_num == 0:
-        return 0.
+        return 0.0
     else:
         return float(np.sum(r_arr) / all_pos_num)
 
 
-def hit_at_k(r: Sequence[Union[int, float]], k: int) -> float:
+def hit_at_k(r: Sequence[int | float], k: int) -> float:
     """
     Hit@K: 1 if at least one relevant item appears in top-K, else 0.
 
@@ -188,9 +190,9 @@ def hit_at_k(r: Sequence[Union[int, float]], k: int) -> float:
     """
     r_arr: npt.NDArray[np.integer] = np.array(r)[:k]
     if np.sum(r_arr) > 0:
-        return 1.
+        return 1.0
     else:
-        return 0.
+        return 0.0
 
 
 def F1(pre: float, rec: float) -> float:
@@ -207,7 +209,7 @@ def F1(pre: float, rec: float) -> float:
     if pre + rec > 0:
         return (2.0 * pre * rec) / (pre + rec)
     else:
-        return 0.
+        return 0.0
 
 
 def auc(ground_truth: list[int], prediction: list[float]) -> float:
@@ -227,5 +229,5 @@ def auc(ground_truth: list[int], prediction: list[float]) -> float:
     try:
         res: float = roc_auc_score(y_true=ground_truth, y_score=prediction)
     except Exception:
-        res = 0.
+        res = 0.0
     return res

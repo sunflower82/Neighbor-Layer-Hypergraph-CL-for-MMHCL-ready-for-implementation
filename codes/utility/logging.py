@@ -16,10 +16,9 @@ File structure created by the logger:
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
+import os
 import pathlib
-from typing import Optional
 
 
 class Logger:
@@ -39,16 +38,16 @@ class Logger:
         path: str,
         is_debug: str,
         target: str = "log",
-        path2: Optional[str] = None,
-        ablation_target: Optional[str] = None,
+        path2: str | None = None,
+        ablation_target: str | None = None,
     ) -> None:
         # Ensure the log directory exists
         pathlib.Path(f"{path}").mkdir(parents=True, exist_ok=True)
         self.target: str = target
         self.path: str = path
-        self.log_: str = is_debug                        # file logging enabled?
-        self.path2: Optional[str] = path2                # secondary (shared) log directory
-        self.ablation_target: Optional[str] = ablation_target
+        self.log_: str = is_debug  # file logging enabled?
+        self.path2: str | None = path2  # secondary (shared) log directory
+        self.ablation_target: str | None = ablation_target
 
         # Mark the start of a new training run in the log
         self.logging("#" * 30 + "   New Logger Start   " + "#" * 30)
@@ -66,19 +65,19 @@ class Logger:
         """
         s: str = str(s)
         # Always print to console
-        print(datetime.now().strftime('%Y-%m-%d-%H:%M:'), s)
+        print(datetime.now().strftime("%Y-%m-%d-%H:%M:"), s)
 
         # Append to primary log file
         if self.log_:
-            with open(os.path.join(self.path, f"{self.target}.txt"), 'a+') as f_log:
-                f_log.write(
-                    str(datetime.now().strftime('%Y-%m-%d %H:%M:')) + s + '\n'
-                )
+            with open(os.path.join(self.path, f"{self.target}.txt"), "a+") as f_log:
+                f_log.write(str(datetime.now().strftime("%Y-%m-%d %H:%M:")) + s + "\n")
             # Append to secondary (shared) log file for cross-run comparison
             if self.path2:
-                with open(os.path.join(self.path2, f"{self.target}.txt"), 'a+') as f_log:
+                with open(
+                    os.path.join(self.path2, f"{self.target}.txt"), "a+"
+                ) as f_log:
                     f_log.write(
-                        str(datetime.now().strftime('%Y-%m-%d %H:%M:')) + s + '\n'
+                        str(datetime.now().strftime("%Y-%m-%d %H:%M:")) + s + "\n"
                     )
 
     def logging_sum(self, s: str) -> None:
@@ -94,7 +93,6 @@ class Logger:
         if self.path2:
             print(s)
             with open(
-                os.path.join(self.path2, f"sum_{str(self.ablation_target)}.txt"),
-                'a+'
+                os.path.join(self.path2, f"sum_{str(self.ablation_target)}.txt"), "a+"
             ) as f_log:
-                f_log.write(s + '\n')
+                f_log.write(s + "\n")

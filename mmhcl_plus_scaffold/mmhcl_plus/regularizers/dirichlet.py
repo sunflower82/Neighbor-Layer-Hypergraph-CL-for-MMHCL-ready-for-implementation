@@ -37,11 +37,11 @@ def dirichlet_energy_batch(
         lap_block = lap_block.to(E_batch.device)
 
     if lap_block.is_sparse:
-        prod = torch.sparse.mm(lap_block, E_batch)   # [B, d]
+        prod = torch.sparse.mm(lap_block, E_batch)  # [B, d]
     else:
-        prod = lap_block @ E_batch                    # [B, d]
+        prod = lap_block @ E_batch  # [B, d]
 
-    return torch.trace(E_batch.T @ prod)              # scalar
+    return torch.trace(E_batch.T @ prod)  # scalar
 
 
 def dirichlet_energy_minibatch(

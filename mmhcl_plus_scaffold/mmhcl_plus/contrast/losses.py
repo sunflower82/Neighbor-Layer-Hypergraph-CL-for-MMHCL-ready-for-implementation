@@ -28,13 +28,43 @@ For the i2i / InfoNCE branch:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
-
 
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
+
+
+def _align_chunk_size_tensor_cores(chunk_size: int, n: int) -> int:
+    """Snap chunk size to a multiple of 64 for Tensor Core throughput (report §low-prio)."""
+    if n <= 0:
+        return 1
+    chunk_size = max(1, min(chunk_size, n))
+    aligned = (chunk_size // 64) * 64
+    if aligned >= 64:
+        return aligned
+    return min(64, n)
+
+
+def _maybe_torch_compile(fn):
+    """
+    JIT-compile dense loss kernels (MMHCL+ Optimization Report — Opt. 1).
+
+    Set environment variable MMHCL_DISABLE_TORCH_COMPILE=1 to force eager mode.
+    """
+    if os.environ.get("MMHCL_DISABLE_TORCH_COMPILE", "").strip():
+        return fn
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return fn
+    try:
+        return compile_fn(fn, dynamic=True, fullgraph=False)
+    except Exception:
+        return fn
+
 
 def off_diagonal(x: torch.Tensor) -> torch.Tensor:
     """Return all off-diagonal elements of a square matrix as a 1-D tensor."""
@@ -47,7 +77,8 @@ def off_diagonal(x: torch.Tensor) -> torch.Tensor:
 # Barlow Twins (u2u branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
 
-def barlow_twins_loss(
+
+def _barlow_twins_loss_impl(
     z1: torch.Tensor,
     z2: torch.Tensor,
     lambd: float = 5e-3,
@@ -94,11 +125,15 @@ def barlow_twins_loss(
     return on_diag + lambd * off_diag_term
 
 
+barlow_twins_loss = _maybe_torch_compile(_barlow_twins_loss_impl)
+
+
 # ---------------------------------------------------------------------------
 # Chunked InfoNCE (i2i branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
 
-def chunked_info_nce_loss(
+
+def _chunked_info_nce_loss_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     tau: float = 0.2,
@@ -133,13 +168,14 @@ def chunked_info_nce_loss(
     q = F.normalize(q, p=2, dim=-1)
     k = F.normalize(k, p=2, dim=-1)
     n = q.size(0)
+    chunk_size = _align_chunk_size_tensor_cores(chunk_size, n)
     labels = torch.arange(n, device=q.device)
     losses: list[torch.Tensor] = []
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        chunk_q = q[start:end]                       # [C, d]
-        logits = chunk_q @ k.T / tau                 # [C, N]
+        chunk_q = q[start:end]  # [C, d]
+        logits = chunk_q @ k.T / tau  # [C, N]
 
         if dynamic_weights is not None:
             # Log-prior correction (adaptive sample weighting)
@@ -151,12 +187,18 @@ def chunked_info_nce_loss(
     return torch.stack(losses).mean()
 
 
+chunked_info_nce_loss = _maybe_torch_compile(_chunked_info_nce_loss_impl)
+
+
 def temperature_free_info_nce_loss(
     q: torch.Tensor,
     k: torch.Tensor,
 ) -> torch.Tensor:
     """InfoNCE with τ = 1.0 (temperature-free baseline)."""
-    return chunked_info_nce_loss(q, k, tau=1.0, chunk_size=max(256, min(2048, q.size(0))))
+    n = q.size(0)
+    cs = max(256, min(2048, n))
+    cs = _align_chunk_size_tensor_cores(cs, n)
+    return chunked_info_nce_loss(q, k, tau=1.0, chunk_size=cs)
 
 
 def info_nce_loss(
@@ -175,6 +217,7 @@ def info_nce_loss(
 # ---------------------------------------------------------------------------
 # BPR loss (main recommendation task)
 # ---------------------------------------------------------------------------
+
 
 def bpr_loss(
     pos_scores: torch.Tensor,

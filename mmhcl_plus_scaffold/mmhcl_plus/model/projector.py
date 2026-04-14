@@ -1,5 +1,6 @@
 import torch.nn as nn
 
+
 class ExpandedProjector(nn.Module):
     def __init__(self, in_dim=64, hidden_dim=2048, out_dim=8192):
         super().__init__()

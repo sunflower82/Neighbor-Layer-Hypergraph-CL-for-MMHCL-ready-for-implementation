@@ -32,16 +32,16 @@ Graph construction pipeline for the Item-Item Hypergraph:
 
 from __future__ import annotations
 
-from typing import Any, Union
+import argparse
+import json
+import random as rd
+from time import time
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
-import random as rd
 import scipy.sparse as sp
-from time import time
-import json
 from utility.parser import parse_args
-import argparse
 
 args: argparse.Namespace = parse_args()
 
@@ -62,7 +62,7 @@ def _torch_load(path: str) -> Any:
 # ===========================================================================
 #  Data — dataset loading, graph building, and BPR sampling
 # ===========================================================================
-class Data(object):
+class Data:
     """
     Loads a recommendation dataset and builds all required adjacency matrices.
 
@@ -88,12 +88,12 @@ class Data(object):
             path       : root path to the dataset (e.g. '../data/Clothing')
             batch_size : number of users to sample per training batch
         """
-        self.path: str = path + '/%d-core' % args.core
+        self.path: str = f"{path}/{args.core}-core"
         self.batch_size: int = batch_size
 
-        train_file: str = path + '/%d-core/train.json' % (args.core)
-        val_file: str = path + '/%d-core/val.json' % (args.core)
-        test_file: str = path + '/%d-core/test.json' % (args.core)
+        train_file: str = f"{path}/{args.core}-core/train.json"
+        val_file: str = f"{path}/{args.core}-core/val.json"
+        test_file: str = f"{path}/{args.core}-core/test.json"
 
         # --- Count users, items, and interactions from JSON files ---
         self.n_users: int = 0
@@ -103,7 +103,7 @@ class Data(object):
         self.n_val: int = 0
         self.neg_pools: dict[int, list[int]] = {}
 
-        self.exist_users: list[int] = []   # users with ≥ 1 training interaction
+        self.exist_users: list[int] = []  # users with ≥ 1 training interaction
 
         train: dict[str, list[int]] = json.load(open(train_file))
         test: dict[str, list[int]] = json.load(open(test_file))
@@ -125,7 +125,7 @@ class Data(object):
             try:
                 self.n_items = max(self.n_items, max(items))
                 self.n_test += len(items)
-            except:
+            except (TypeError, ValueError):
                 continue
 
         # Scan validation data
@@ -134,7 +134,7 @@ class Data(object):
             try:
                 self.n_items = max(self.n_items, max(items))
                 self.n_val += len(items)
-            except:
+            except (TypeError, ValueError):
                 continue
 
         # +1 because IDs are 0-indexed
@@ -162,7 +162,7 @@ class Data(object):
                 continue
             uid = int(uid_str)
             for idx, i in enumerate(train_items_list):
-                self.R[uid, i] = 1.
+                self.R[uid, i] = 1.0
             self.train_items[uid] = train_items_list
 
         # Populate test_set
@@ -172,7 +172,7 @@ class Data(object):
                 continue
             try:
                 self.test_set[uid] = test_items_list
-            except:
+            except (TypeError, ValueError, KeyError):
                 continue
 
         # Populate val_set
@@ -182,15 +182,13 @@ class Data(object):
                 continue
             try:
                 self.val_set[uid] = val_items_list
-            except:
+            except (TypeError, ValueError, KeyError):
                 continue
 
     # -----------------------------------------------------------------------
     #  Utility: scipy sparse → torch sparse
     # -----------------------------------------------------------------------
-    def sparse_mx_to_torch_sparse_tensor(
-        self, sparse_mx: sp.spmatrix
-    ) -> torch.Tensor:
+    def sparse_mx_to_torch_sparse_tensor(self, sparse_mx: sp.spmatrix) -> torch.Tensor:
         """Convert a scipy sparse matrix to a torch sparse COO tensor."""
         sparse_mx = sparse_mx.tocoo().astype(np.float32)
         indices: torch.Tensor = torch.from_numpy(
@@ -202,12 +200,10 @@ class Data(object):
 
     def print_statistics(self) -> None:
         """Print basic dataset statistics to the console."""
-        print('n_users=%d, n_items=%d' % (self.n_users, self.n_items))
-        print('n_interactions=%d' % (self.n_train + self.n_test))
-        print('n_train=%d, n_test=%d, sparsity=%.5f' % (
-            self.n_train, self.n_test,
-            (self.n_train + self.n_test) / (self.n_users * self.n_items)
-        ))
+        print(f"n_users={self.n_users}, n_items={self.n_items}")
+        print(f"n_interactions={self.n_train + self.n_test}")
+        sparsity = (self.n_train + self.n_test) / (self.n_users * self.n_items)
+        print(f"n_train={self.n_train}, n_test={self.n_test}, sparsity={sparsity:.5f}")
 
     # ===================================================================
     #  BPR Sampling
@@ -266,8 +262,8 @@ class Data(object):
         pos_items: list[int] = []
         neg_items: list[int] = []
         for u in users:
-            pos_items += sample_pos_items_for_u(u, 1)    # 1 positive per user
-            neg_items += sample_neg_items_for_u(u, 1)    # 1 negative per user
+            pos_items += sample_pos_items_for_u(u, 1)  # 1 positive per user
+            neg_items += sample_neg_items_for_u(u, 1)  # 1 negative per user
         return users, pos_items, neg_items
 
     # ===================================================================
@@ -286,15 +282,15 @@ class Data(object):
         """
         try:
             t1: float = time()
-            adj_mat: sp.spmatrix = sp.load_npz(self.path + '/s_adj_mat.npz')
-            norm_adj_mat: sp.spmatrix = sp.load_npz(self.path + '/s_norm_adj_mat.npz')
-            mean_adj_mat: sp.spmatrix = sp.load_npz(self.path + '/s_mean_adj_mat.npz')
-            print('already load adj matrix', adj_mat.shape, time() - t1)
+            adj_mat: sp.spmatrix = sp.load_npz(self.path + "/s_adj_mat.npz")
+            norm_adj_mat: sp.spmatrix = sp.load_npz(self.path + "/s_norm_adj_mat.npz")
+            mean_adj_mat: sp.spmatrix = sp.load_npz(self.path + "/s_mean_adj_mat.npz")
+            print("already load adj matrix", adj_mat.shape, time() - t1)
         except Exception:
             adj_mat, norm_adj_mat, mean_adj_mat = self.create_adj_mat()
-            sp.save_npz(self.path + '/s_adj_mat.npz', adj_mat)
-            sp.save_npz(self.path + '/s_norm_adj_mat.npz', norm_adj_mat)
-            sp.save_npz(self.path + '/s_mean_adj_mat.npz', mean_adj_mat)
+            sp.save_npz(self.path + "/s_adj_mat.npz", adj_mat)
+            sp.save_npz(self.path + "/s_norm_adj_mat.npz", norm_adj_mat)
+            sp.save_npz(self.path + "/s_mean_adj_mat.npz", mean_adj_mat)
         return adj_mat, norm_adj_mat, mean_adj_mat
 
     def create_adj_mat(self) -> tuple[sp.csr_matrix, sp.csr_matrix, sp.csr_matrix]:
@@ -306,17 +302,16 @@ class Data(object):
         """
         t1: float = time()
         adj_mat: sp.spmatrix = sp.dok_matrix(
-            (self.n_users + self.n_items, self.n_users + self.n_items),
-            dtype=np.float32
+            (self.n_users + self.n_items, self.n_users + self.n_items), dtype=np.float32
         )
         adj_mat = adj_mat.tolil()
         R: sp.lil_matrix = self.R.tolil()
 
         # Fill in the bipartite structure
-        adj_mat[:self.n_users, self.n_users:] = R       # user → item
-        adj_mat[self.n_users:, :self.n_users] = R.T     # item → user
+        adj_mat[: self.n_users, self.n_users :] = R  # user → item
+        adj_mat[self.n_users :, : self.n_users] = R.T  # item → user
         adj_mat = adj_mat.todok()
-        print('already create adjacency matrix', adj_mat.shape, time() - t1)
+        print("already create adjacency matrix", adj_mat.shape, time() - t1)
 
         t2: float = time()
 
@@ -324,17 +319,17 @@ class Data(object):
             """Row-normalise: D^{-1} · A"""
             rowsum: npt.NDArray[np.floating] = np.array(adj.sum(1))
             d_inv: npt.NDArray[np.floating] = np.power(rowsum, -1).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
+            d_inv[np.isinf(d_inv)] = 0.0
             d_mat_inv: sp.dia_matrix = sp.diags(d_inv)
             norm_adj: sp.spmatrix = d_mat_inv.dot(adj)
-            print('generate single-normalized adjacency matrix.')
+            print("generate single-normalized adjacency matrix.")
             return norm_adj.tocoo()
 
         def get_D_inv(adj: sp.spmatrix) -> sp.dia_matrix:
             """Compute the inverse degree matrix D^{-1}."""
             rowsum: npt.NDArray[np.floating] = np.array(adj.sum(1))
             d_inv: npt.NDArray[np.floating] = np.power(rowsum, -1).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
+            d_inv[np.isinf(d_inv)] = 0.0
             d_mat_inv: sp.dia_matrix = sp.diags(d_inv)
             return d_mat_inv
 
@@ -345,7 +340,9 @@ class Data(object):
             temp: npt.NDArray[np.floating] = np.dot(
                 np.diag(np.power(degree, -1)), dense_A
             )
-            print('check normalized adjacency matrix whether equal to this laplacian matrix.')
+            print(
+                "check normalized adjacency matrix whether equal to this laplacian matrix."
+            )
             return temp
 
         # A + I  (self-loops) then normalise
@@ -355,14 +352,14 @@ class Data(object):
         # A without self-loops, normalised
         mean_adj_mat: sp.coo_matrix = normalized_adj_single(adj_mat)
 
-        print('already normalize adjacency matrix', time() - t2)
+        print("already normalize adjacency matrix", time() - t2)
         return adj_mat.tocsr(), norm_adj_mat.tocsr(), mean_adj_mat.tocsr()
 
     # ===================================================================
     #  Dense Normalisation Utility
     # ===================================================================
     def norm_dense(
-        self, adj: torch.Tensor, normalization: str = 'origin'
+        self, adj: torch.Tensor, normalization: str = "origin"
     ) -> torch.Tensor:
         """
         Normalise a dense adjacency matrix.
@@ -380,11 +377,11 @@ class Data(object):
         """
         L_norm: torch.Tensor
 
-        if normalization == 'sym':
+        if normalization == "sym":
             # Symmetric normalisation: D^{-1/2} · A · D^{-1/2}
             rowsum: torch.Tensor = torch.sum(adj, -1)
             d_inv_sqrt: torch.Tensor = torch.pow(rowsum, -0.5)
-            d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+            d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
             d_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_inv_sqrt)
             L_norm = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
 
@@ -393,27 +390,25 @@ class Data(object):
             # D_row^{-1/2} · A · D_col^{-1/2}
             rowsum = torch.sum(adj, -1)
             d_row_inv_sqrt: torch.Tensor = torch.pow(rowsum, -0.5)
-            d_row_inv_sqrt[torch.isinf(d_row_inv_sqrt)] = 0.
+            d_row_inv_sqrt[torch.isinf(d_row_inv_sqrt)] = 0.0
             d_row_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_row_inv_sqrt)
 
             colsum: torch.Tensor = torch.sum(adj, -2)
             d_col_inv_sqrt: torch.Tensor = torch.pow(colsum, -0.5)
-            d_col_inv_sqrt[torch.isinf(d_col_inv_sqrt)] = 0.
+            d_col_inv_sqrt[torch.isinf(d_col_inv_sqrt)] = 0.0
             d_col_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_col_inv_sqrt)
 
-            L_norm = torch.mm(
-                torch.mm(d_row_mat_inv_sqrt, adj), d_col_mat_inv_sqrt
-            )
+            L_norm = torch.mm(torch.mm(d_row_mat_inv_sqrt, adj), d_col_mat_inv_sqrt)
 
-        elif normalization == 'rw':
+        elif normalization == "rw":
             # Random-walk normalisation: D^{-1} · A
             rowsum = torch.sum(adj, -1)
             d_inv: torch.Tensor = torch.pow(rowsum, -1)
-            d_inv[torch.isinf(d_inv)] = 0.
+            d_inv[torch.isinf(d_inv)] = 0.0
             d_mat_inv: torch.Tensor = torch.diagflat(d_inv)
             L_norm = torch.mm(d_mat_inv, adj)
 
-        elif normalization == 'origin':
+        elif normalization == "origin":
             # No normalisation
             L_norm = adj
 
@@ -422,7 +417,7 @@ class Data(object):
     # ===================================================================
     #  User-Item Bipartite Graph
     # ===================================================================
-    def get_UI_mat(self, norm_type: str = 'sym') -> torch.Tensor:
+    def get_UI_mat(self, norm_type: str = "sym") -> torch.Tensor:
         """
         Build or load the user-item bipartite adjacency matrix.
 
@@ -432,26 +427,26 @@ class Data(object):
         t: float = time()
         UI_mat: torch.Tensor
         try:
-            UI_mat = _torch_load(self.path + '/UI_mat_' + norm_type + ".pth")
+            UI_mat = _torch_load(self.path + "/UI_mat_" + norm_type + ".pth")
         except Exception:
             # First run: build from scratch
             adj_mat_sp: sp.spmatrix = sp.dok_matrix(
                 (self.n_users + self.n_items, self.n_users + self.n_items),
-                dtype=np.float32
+                dtype=np.float32,
             )
             adj_mat_lil: sp.lil_matrix = adj_mat_sp.tolil()
             R: sp.lil_matrix = self.R.tolil()
-            adj_mat_lil[:self.n_users, self.n_users:] = R       # user → item
-            adj_mat_lil[self.n_users:, :self.n_users] = R.T     # item → user
+            adj_mat_lil[: self.n_users, self.n_users :] = R  # user → item
+            adj_mat_lil[self.n_users :, : self.n_users] = R.T  # item → user
             adj_mat_dense: npt.NDArray[np.float32] = np.asarray(adj_mat_lil.todense())
             UI_mat = torch.from_numpy(adj_mat_dense).float()
             UI_mat = self.norm_dense(UI_mat, norm_type)
             UI_mat = UI_mat.to_sparse()
-            torch.save(UI_mat, self.path + '/UI_mat_' + norm_type + ".pth")
+            torch.save(UI_mat, self.path + "/UI_mat_" + norm_type + ".pth")
         print("End Load UI_mat:[%.1fs](" % (time() - t) + norm_type + ")")
         return UI_mat
 
-    def get_UI_single_mat(self, norm_type: str = '2sym') -> torch.Tensor:
+    def get_UI_single_mat(self, norm_type: str = "2sym") -> torch.Tensor:
         """
         Build or load the raw user-item interaction matrix R (NOT bipartite).
 
@@ -461,20 +456,20 @@ class Data(object):
         t: float = time()
         UI_mat: torch.Tensor
         try:
-            UI_mat = _torch_load(self.path + '/UI_single_mat_' + norm_type + ".pth")
+            UI_mat = _torch_load(self.path + "/UI_single_mat_" + norm_type + ".pth")
         except Exception:
             adj_mat_dense: npt.NDArray[np.float32] = np.asarray(self.R.todense())
             UI_mat = torch.from_numpy(adj_mat_dense).float()
             UI_mat = self.norm_dense(UI_mat, norm_type)
             UI_mat = UI_mat.to_sparse()
-            torch.save(UI_mat, self.path + '/UI_single_mat_' + norm_type + ".pth")
+            torch.save(UI_mat, self.path + "/UI_single_mat_" + norm_type + ".pth")
         print("End Load UI_single_mat:[%.1fs](" % (time() - t) + norm_type + ")")
         return UI_mat
 
     # ===================================================================
     #  User-User Co-Interaction Graph
     # ===================================================================
-    def get_U2U_mat(self, norm_type: str = 'rw') -> torch.Tensor:
+    def get_U2U_mat(self, norm_type: str = "rw") -> torch.Tensor:
         """
         Build or load the user-user co-interaction graph.
 
@@ -485,19 +480,17 @@ class Data(object):
         t: float = time()
         User_mat: torch.Tensor
         try:
-            User_mat = _torch_load(self.path + '/User_mat_' + norm_type + ".pth")
+            User_mat = _torch_load(self.path + "/User_mat_" + norm_type + ".pth")
         except Exception:
-            R: torch.Tensor = torch.from_numpy(
-                np.asarray(self.R.todense())
-            ).float()
+            R: torch.Tensor = torch.from_numpy(np.asarray(self.R.todense())).float()
             # Co-interaction: User_mat[u1, u2] = number of shared items
             User_mat = R @ R.T
             n_user: int = User_mat.size()[0]
             mask: torch.Tensor = torch.eye(n_user)
-            User_mat[mask > 0] = 0   # Remove self-connections
+            User_mat[mask > 0] = 0  # Remove self-connections
             User_mat = self.norm_dense(User_mat, norm_type)
             User_mat = User_mat.to_sparse()
-            torch.save(User_mat, self.path + '/User_mat_' + norm_type + ".pth")
+            torch.save(User_mat, self.path + "/User_mat_" + norm_type + ".pth")
         print("End Load User_mat:[%.1fs](" % (time() - t) + norm_type + ")")
         return User_mat
 
@@ -506,7 +499,7 @@ class Data(object):
     # ===================================================================
     def get_I2I_single_mat(
         self, norm_type: str = "sym"
-    ) -> tuple[torch.Tensor, torch.Tensor, Union[torch.Tensor, str]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | str]:
         """
         Build or load individual per-modality item-item similarity graphs.
 
@@ -519,21 +512,21 @@ class Data(object):
         text_adj: torch.Tensor
         audio_adj: torch.Tensor
         try:
-            image_adj = _torch_load(self.path + '/Image_mat_' + norm_type + ".pth")
-            text_adj = _torch_load(self.path + '/Text_mat_' + norm_type + ".pth")
+            image_adj = _torch_load(self.path + "/Image_mat_" + norm_type + ".pth")
+            text_adj = _torch_load(self.path + "/Text_mat_" + norm_type + ".pth")
             if args.dataset == "tiktok":
-                audio_adj = _torch_load(self.path + '/Audio_mat_' + norm_type + ".pth")
+                audio_adj = _torch_load(self.path + "/Audio_mat_" + norm_type + ".pth")
         except Exception:
             # Load raw multi-modal features
             image_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/image_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/image_feat.npy")
             ).float()
             text_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/text_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/text_feat.npy")
             ).float()
             if args.dataset == "tiktok":
                 audio_feats: torch.Tensor = torch.tensor(
-                    np.load('../data/{}/audio_feat.npy'.format(args.dataset))
+                    np.load(f"../data/{args.dataset}/audio_feat.npy")
                 ).float()
 
             # Cosine similarity → k-NN → normalise for each modality
@@ -557,12 +550,14 @@ class Data(object):
             if args.dataset == "tiktok":
                 audio_adj = audio_adj.to_sparse()
 
-            torch.save(image_adj, self.path + '/Image_mat_' + norm_type + ".pth")
-            torch.save(text_adj, self.path + '/Text_mat_' + norm_type + ".pth")
+            torch.save(image_adj, self.path + "/Image_mat_" + norm_type + ".pth")
+            torch.save(text_adj, self.path + "/Text_mat_" + norm_type + ".pth")
             if args.dataset == "tiktok":
-                torch.save(audio_adj, self.path + '/Audio_mat_' + norm_type + ".pth")
+                torch.save(audio_adj, self.path + "/Audio_mat_" + norm_type + ".pth")
 
-        print("End Load I2I media-specific mat:[%.1fs](" % (time() - t) + norm_type + ")")
+        print(
+            "End Load I2I media-specific mat:[%.1fs](" % (time() - t) + norm_type + ")"
+        )
         if args.dataset == "tiktok":
             return image_adj, text_adj, audio_adj
         else:
@@ -578,7 +573,9 @@ class Data(object):
         Returns:
             Sparse tensor of shape (n_items, 2 × n_items).
         """
-        print(f"Loading I2I multi-media Hypergraph mat:({norm_type})_topk:{str(args.topk)}")
+        print(
+            f"Loading I2I multi-media Hypergraph mat:({norm_type})_topk:{str(args.topk)}"
+        )
         t: float = time()
         Hypergraph: torch.Tensor
         try:
@@ -588,10 +585,10 @@ class Data(object):
         except Exception:
             # Load features for both modalities
             image_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/image_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/image_feat.npy")
             ).float()
             text_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/text_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/text_feat.npy")
             ).float()
 
             # Build per-modality k-NN similarity graphs
@@ -607,9 +604,13 @@ class Data(object):
             Hypergraph = Hypergraph.to_sparse()
             torch.save(
                 Hypergraph,
-                f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth"
+                f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth",
             )
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
+        print(
+            "End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph
 
     def get_I2I_Hypergraph_mul_mat(self, norm_type: str = "sym") -> torch.Tensor:
@@ -618,7 +619,9 @@ class Data(object):
 
         Shape: (n_items × n_items), sparse.
         """
-        print(f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}")
+        print(
+            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}"
+        )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
@@ -632,9 +635,13 @@ class Data(object):
             Hypergraph_mul = Hypergraph_mul.to_sparse()
             torch.save(
                 Hypergraph_mul,
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth"
+                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth",
             )
-        print("End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t) + norm_type + ")")
+        print(
+            "End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph_mul
 
     # ===================================================================
@@ -646,10 +653,16 @@ class Data(object):
         t: float = time()
         Hypergraph: torch.Tensor
         try:
-            Hypergraph = _torch_load(self.path + '/hypergraph_mat_' + norm_type + ".pth")
+            Hypergraph = _torch_load(
+                self.path + "/hypergraph_mat_" + norm_type + ".pth"
+            )
         except Exception:
-            image_feats: torch.Tensor = _torch_load("../data/{}/img_feat.pt".format(args.dataset))
-            text_feats: torch.Tensor = _torch_load("../data/{}/text_feat.pt".format(args.dataset))
+            image_feats: torch.Tensor = _torch_load(
+                f"../data/{args.dataset}/img_feat.pt"
+            )
+            text_feats: torch.Tensor = _torch_load(
+                f"../data/{args.dataset}/text_feat.pt"
+            )
 
             image_adj: torch.Tensor = self.build_sim(image_feats)
             image_adj = self.build_knn_normalized_graph(image_adj, topk=args.topk)
@@ -660,24 +673,41 @@ class Data(object):
             Hypergraph = torch.cat((image_adj, text_adj), dim=1)
             Hypergraph = self.norm_dense(Hypergraph, norm_type)
             Hypergraph = Hypergraph.to_sparse()
-            torch.save(Hypergraph, self.path + '/hypergraph_mat_' + norm_type + ".pth")
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
+            torch.save(Hypergraph, self.path + "/hypergraph_mat_" + norm_type + ".pth")
+        print(
+            "End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph
 
     def get_I2I_Hypergraph_mul_mat_pt(self, norm_type: str = "sym") -> torch.Tensor:
         """Same as get_I2I_Hypergraph_mul_mat() but uses .pt features."""
-        print("Loading I2I multi-media Hypergraph mul mat*mat.T pytorch:(" + norm_type + ")")
+        print(
+            "Loading I2I multi-media Hypergraph mul mat*mat.T pytorch:("
+            + norm_type
+            + ")"
+        )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
-            Hypergraph_mul = _torch_load(self.path + '/hypergraph_mat_mul' + norm_type + ".pth")
+            Hypergraph_mul = _torch_load(
+                self.path + "/hypergraph_mat_mul" + norm_type + ".pth"
+            )
         except Exception:
             Hypergraph: torch.Tensor = self.get_I2I_Hypergrah_mat_pt("origin")
             Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
             Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
             Hypergraph_mul = Hypergraph_mul.to_sparse()
-            torch.save(Hypergraph_mul, self.path + '/hypergraph_mat_mul' + norm_type + ".pth")
-        print("End Load I2I multi-media Hypergraph mul mat*mat.T pytorch:[%.1fs](" % (time() - t) + norm_type + ")")
+            torch.save(
+                Hypergraph_mul, self.path + "/hypergraph_mat_mul" + norm_type + ".pth"
+            )
+        print(
+            "End Load I2I multi-media Hypergraph mul mat*mat.T pytorch:[%.1fs]("
+            % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph_mul
 
     # ===================================================================
@@ -691,7 +721,9 @@ class Data(object):
         Returns:
             Sparse tensor of shape (n_items, 3 × n_items).
         """
-        print(f"Loading I2I multi-media Hypergraph mat:({ norm_type })_topk:{str(args.topk)}")
+        print(
+            f"Loading I2I multi-media Hypergraph mat:({norm_type})_topk:{str(args.topk)}"
+        )
         t: float = time()
         Hypergraph: torch.Tensor
         try:
@@ -701,13 +733,13 @@ class Data(object):
         except Exception:
             # Load all three modality features
             image_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/image_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/image_feat.npy")
             ).float()
             text_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/text_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/text_feat.npy")
             ).float()
             audio_feats: torch.Tensor = torch.tensor(
-                np.load('../data/{}/audio_feat.npy'.format(args.dataset))
+                np.load(f"../data/{args.dataset}/audio_feat.npy")
             ).float()
 
             # Build k-NN similarity graph for each modality
@@ -728,9 +760,13 @@ class Data(object):
             Hypergraph = Hypergraph.to_sparse()
             torch.save(
                 Hypergraph,
-                f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth"
+                f"{self.path}/hypergraph_mat_{norm_type}_topk_{str(args.topk)}.pth",
             )
-        print("End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t) + norm_type + ")")
+        print(
+            "End Load I2I multi-media Hypergraph mat:[%.1fs](" % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph
 
     def get_tiktok_I2I_Hypergraph_mul_mat(self, norm_type: str = "sym") -> torch.Tensor:
@@ -739,7 +775,9 @@ class Data(object):
 
         Shape: (n_items × n_items), sparse.
         """
-        print(f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}")
+        print(
+            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}"
+        )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
@@ -753,9 +791,13 @@ class Data(object):
             Hypergraph_mul = Hypergraph_mul.to_sparse()
             torch.save(
                 Hypergraph_mul,
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth"
+                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth",
             )
-        print("End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t) + norm_type + ")")
+        print(
+            "End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t)
+            + norm_type
+            + ")"
+        )
         return Hypergraph_mul
 
     # ===================================================================
@@ -782,9 +824,7 @@ class Data(object):
         sim: torch.Tensor = torch.mm(context_norm, context_norm.transpose(1, 0))
         return sim
 
-    def build_knn_normalized_graph(
-        self, adj: torch.Tensor, topk: int
-    ) -> torch.Tensor:
+    def build_knn_normalized_graph(self, adj: torch.Tensor, topk: int) -> torch.Tensor:
         """
         k-NN sparsification: keep only the top-k values per row.
 
@@ -801,5 +841,5 @@ class Data(object):
         knn_val, knn_ind = torch.topk(adj, topk, dim=-1)
         # Scatter top-k values into a zeroed matrix, then binarise
         adj = (torch.zeros_like(adj)).scatter_(-1, knn_ind, knn_val)
-        adj[adj > 0] = 1.
+        adj[adj > 0] = 1.0
         return adj

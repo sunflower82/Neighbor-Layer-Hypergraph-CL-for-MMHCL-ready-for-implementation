@@ -86,7 +86,7 @@ class LayerwiseEncoder(nn.Module):
             use_ckpt = (
                 self.use_checkpoint
                 and checkpoint_fn is not None
-                and layer_id >= self.max_g_layers   # only checkpoint deep layers
+                and layer_id >= self.max_g_layers  # only checkpoint deep layers
             )
 
             if use_ckpt:

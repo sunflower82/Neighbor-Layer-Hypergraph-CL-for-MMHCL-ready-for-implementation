@@ -80,9 +80,7 @@ def build_knn_normalized_graph(
         # --- Sparse output path ---
         # Build edge list from the top-k indices
         tuple_list: list[list[int]] = [
-            [row, int(col)]
-            for row in range(len(knn_ind))
-            for col in knn_ind[row]
+            [row, int(col)] for row in range(len(knn_ind)) for col in knn_ind[row]
         ]
         row_idx: list[int] = [i[0] for i in tuple_list]
         col_idx: list[int] = [i[1] for i in tuple_list]
@@ -100,8 +98,8 @@ def build_knn_normalized_graph(
     else:
         # --- Dense output path ---
         # Scatter top-k values into a zero matrix to form the adjacency
-        weighted_adjacency_matrix: torch.Tensor = (
-            (torch.zeros_like(adj)).scatter_(-1, knn_ind, knn_val)
+        weighted_adjacency_matrix: torch.Tensor = (torch.zeros_like(adj)).scatter_(
+            -1, knn_ind, knn_val
         )
         return get_dense_laplacian(weighted_adjacency_matrix, normalization=norm_type)
 
@@ -110,7 +108,7 @@ def get_sparse_laplacian(
     edge_index: torch.Tensor,
     edge_weight: torch.Tensor,
     num_nodes: int,
-    normalization: str = 'none',
+    normalization: str = "none",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Normalise edge weights of a sparse graph (given as edge_index + edge_weight).
@@ -136,21 +134,22 @@ def get_sparse_laplacian(
     deg: torch.Tensor
     try:
         from torch_scatter import scatter_add
+
         deg = scatter_add(edge_weight, row, dim=0, dim_size=num_nodes)
     except ImportError:
         deg = torch.zeros(num_nodes, device=edge_weight.device, dtype=edge_weight.dtype)
         deg.scatter_add_(0, row, edge_weight)
 
-    if normalization == 'sym':
+    if normalization == "sym":
         # Symmetric: D^{-½} · w · D^{-½}
         deg_inv_sqrt: torch.Tensor = deg.pow_(-0.5)
-        deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)
+        deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float("inf"), 0)
         edge_weight = deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
 
-    elif normalization == 'rw':
+    elif normalization == "rw":
         # Random-walk: D^{-1} · w
         deg_inv: torch.Tensor = 1.0 / deg
-        deg_inv.masked_fill_(deg_inv == float('inf'), 0)
+        deg_inv.masked_fill_(deg_inv == float("inf"), 0)
         edge_weight = deg_inv[row] * edge_weight
 
     return edge_index, edge_weight
@@ -158,7 +157,7 @@ def get_sparse_laplacian(
 
 def get_dense_laplacian(
     adj: torch.Tensor,
-    normalization: str = 'none',
+    normalization: str = "none",
 ) -> torch.Tensor:
     """
     Normalise a dense adjacency matrix.
@@ -177,21 +176,21 @@ def get_dense_laplacian(
     """
     L_norm: torch.Tensor
 
-    if normalization == 'sym':
+    if normalization == "sym":
         rowsum: torch.Tensor = torch.sum(adj, -1)
         d_inv_sqrt: torch.Tensor = torch.pow(rowsum, -0.5)
-        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
         d_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_inv_sqrt)
         L_norm = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
 
-    elif normalization == 'rw':
+    elif normalization == "rw":
         rowsum = torch.sum(adj, -1)
         d_inv: torch.Tensor = torch.pow(rowsum, -1)
-        d_inv[torch.isinf(d_inv)] = 0.
+        d_inv[torch.isinf(d_inv)] = 0.0
         d_mat_inv: torch.Tensor = torch.diagflat(d_inv)
         L_norm = torch.mm(d_mat_inv, adj)
 
-    elif normalization == 'none':
+    elif normalization == "none":
         L_norm = adj
 
     return L_norm

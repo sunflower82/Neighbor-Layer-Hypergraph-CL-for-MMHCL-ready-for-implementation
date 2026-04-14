@@ -50,12 +50,13 @@ Output:
 Usage (run from project root):
     python tune_optuna.py
 """
+
 from __future__ import annotations
 
-import sys
-import os
 import copy
 import json
+import os
+import sys
 
 # =====================================================================
 #  Tuning configuration
@@ -66,38 +67,46 @@ STUDY_NAME: str = "MMHCL_Baby_Tuning_v2"
 TRAINING_SEED: int = 2024
 
 # MedianPruner settings
-PRUNER_N_STARTUP_TRIALS: int = 5   # run at least 5 trials before pruning
-PRUNER_N_WARMUP_STEPS: int = 20    # don't prune before eval-step 20
+PRUNER_N_STARTUP_TRIALS: int = 5  # run at least 5 trials before pruning
+PRUNER_N_WARMUP_STEPS: int = 20  # don't prune before eval-step 20
 
 # =====================================================================
 #  Path & sys.argv setup — MUST happen before importing MMHCL modules
 # =====================================================================
 PROJECT_ROOT: str = os.path.dirname(os.path.abspath(__file__))
-CODES_DIR: str = os.path.join(PROJECT_ROOT, 'codes')
+CODES_DIR: str = os.path.join(PROJECT_ROOT, "codes")
 os.chdir(CODES_DIR)
 if CODES_DIR not in sys.path:
     sys.path.insert(0, CODES_DIR)
 
 # Minimal CLI args — Optuna overrides the rest via `args_ns`
 sys.argv = [
-    'main.py',
-    '--dataset', 'Baby',
-    '--batch_size', '1024',
-    '--epoch', '250',
-    '--verbose', '5',
-    '--embed_size', '64',
-    '--core', '5',
-    '--early_stopping_patience', '20',
-    '--early_stopping_min_epochs', '50',
+    "main.py",
+    "--dataset",
+    "Baby",
+    "--batch_size",
+    "1024",
+    "--epoch",
+    "250",
+    "--verbose",
+    "5",
+    "--embed_size",
+    "64",
+    "--core",
+    "5",
+    "--early_stopping_patience",
+    "20",
+    "--early_stopping_min_epochs",
+    "50",
 ]
 
 # =====================================================================
 #  Now safe to import MMHCL modules (data_generator loads once here)
 # =====================================================================
-import optuna                                       # noqa: E402
-import torch                                        # noqa: E402
-from utility.parser import parse_args               # noqa: E402
-from main import train_evaluation_loop              # noqa: E402
+from main import train_evaluation_loop  # noqa: E402
+import optuna  # noqa: E402
+import torch  # noqa: E402
+from utility.parser import parse_args  # noqa: E402
 
 _default_args = parse_args()
 
@@ -117,27 +126,23 @@ def objective(trial: optuna.Trial) -> float:
     args = copy.deepcopy(_default_args)
 
     # ----- Search space targeting Baby's sparsity & long-tail -----
-    args.topk = trial.suggest_int('topk', 2, 15)
-    args.temperature = trial.suggest_float('temperature', 0.1, 0.8, step=0.05)
-    args.regs = trial.suggest_float('regs', 1e-5, 1e-1, log=True)
-    args.user_loss_ratio = trial.suggest_float(
-        'user_loss_ratio', 0.01, 0.15, step=0.01
-    )
-    args.item_loss_ratio = trial.suggest_float(
-        'item_loss_ratio', 0.01, 0.15, step=0.01
-    )
-    args.User_layers = trial.suggest_int('User_layers', 1, 3)
-    args.Item_layers = trial.suggest_int('Item_layers', 1, 3)
+    args.topk = trial.suggest_int("topk", 2, 15)
+    args.temperature = trial.suggest_float("temperature", 0.1, 0.8, step=0.05)
+    args.regs = trial.suggest_float("regs", 1e-5, 1e-1, log=True)
+    args.user_loss_ratio = trial.suggest_float("user_loss_ratio", 0.01, 0.15, step=0.01)
+    args.item_loss_ratio = trial.suggest_float("item_loss_ratio", 0.01, 0.15, step=0.01)
+    args.User_layers = trial.suggest_int("User_layers", 1, 3)
+    args.Item_layers = trial.suggest_int("Item_layers", 1, 3)
 
     # Fixed across trials
     args.seed = TRAINING_SEED
     args.use_wandb = 0
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"[Trial {trial.number + 1}/{N_TRIALS}] Hyperparameters:")
     for k, v in trial.params.items():
         print(f"  {k}: {v}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     try:
         # return_validation=True → Optuna optimises val recall, NOT test
@@ -157,8 +162,7 @@ def objective(trial: optuna.Trial) -> float:
         raise optuna.exceptions.TrialPruned()
 
     print(
-        f"[Trial {trial.number + 1}] "
-        f"Best Validation Recall@20 = {best_val_recall:.6f}"
+        f"[Trial {trial.number + 1}] Best Validation Recall@20 = {best_val_recall:.6f}"
     )
     return best_val_recall
 
@@ -170,8 +174,10 @@ if __name__ == "__main__":
     print("=" * 70)
     print("  MMHCL Optuna Hyperparameter Search — Amazon Baby (v2)")
     print(f"  Trials: {N_TRIALS}  |  Sampler: TPE (seed={OPTUNA_SEED})")
-    print(f"  Pruner: MedianPruner "
-          f"(startup={PRUNER_N_STARTUP_TRIALS}, warmup={PRUNER_N_WARMUP_STEPS})")
+    print(
+        f"  Pruner: MedianPruner "
+        f"(startup={PRUNER_N_STARTUP_TRIALS}, warmup={PRUNER_N_WARMUP_STEPS})"
+    )
     print(f"  Training seed: {TRAINING_SEED} (fixed for fair comparison)")
     gpu_name: str = (
         torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
@@ -202,16 +208,12 @@ if __name__ == "__main__":
         print(f"    {key}: {value}")
 
     # ---- Save full trial dataframe ----
-    results_path: str = os.path.join(
-        PROJECT_ROOT, 'optuna_results_amazon_baby.csv'
-    )
+    results_path: str = os.path.join(PROJECT_ROOT, "optuna_results_amazon_baby.csv")
     study.trials_dataframe().to_csv(results_path, index=False)
     print(f"\n  Trial results saved to: {results_path}")
 
     # ---- Auto-export best config for final multi-seed run ----
-    best_config_path: str = os.path.join(
-        PROJECT_ROOT, 'best_mmhcl_baby_config.json'
-    )
+    best_config_path: str = os.path.join(PROJECT_ROOT, "best_mmhcl_baby_config.json")
     best_config: dict = {
         "study_name": STUDY_NAME,
         "best_validation_recall@20": study.best_value,
@@ -219,7 +221,7 @@ if __name__ == "__main__":
         "n_trials_completed": len(study.trials),
         "best_params": study.best_params,
     }
-    with open(best_config_path, 'w') as f:
+    with open(best_config_path, "w") as f:
         json.dump(best_config, f, indent=4)
 
     print(f"  Best config saved to: {best_config_path}")

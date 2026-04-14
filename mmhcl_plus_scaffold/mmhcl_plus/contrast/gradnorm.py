@@ -155,28 +155,24 @@ class GradNormLossBalancer(nn.Module):
                     loss_i,
                     shared_params,
                     retain_graph=True,
-                    create_graph=False,   # G̃_i detached from w → only w gets grad
+                    create_graph=False,  # G̃_i detached from w → only w gets grad
                     allow_unused=True,
                 )
-                gn2 = sum(
-                    (g.detach() ** 2).sum()
-                    for g in grads
-                    if g is not None
-                )
+                gn2 = sum((g.detach() ** 2).sum() for g in grads if g is not None)
                 g_tilde.append(gn2.sqrt().to(device))
             except Exception:
                 # Safety fallback (e.g. unused task or graph already freed)
                 g_tilde.append(task_losses.new_zeros(()))
 
-        G_tilde = torch.stack(g_tilde).detach()   # [n_tasks], no grad to model
+        G_tilde = torch.stack(g_tilde).detach()  # [n_tasks], no grad to model
 
         # Step 2: weighted gradient norms — G_i = w_i · G̃_i (w_i in graph)
-        G = w * G_tilde   # [n_tasks]
+        G = w * G_tilde  # [n_tasks]
 
         # Step 3: target gradient norms
-        G_bar = G.detach().mean()                          # scalar, detached
+        G_bar = G.detach().mean()  # scalar, detached
         r = task_losses.detach() / (self.l0.to(device) + 1e-8)
-        r_tilde = r / r.mean().clamp_min(1e-8)            # [n_tasks], normalized rates
+        r_tilde = r / r.mean().clamp_min(1e-8)  # [n_tasks], normalized rates
         target = (G_bar * r_tilde.pow(self.alpha)).detach()  # [n_tasks]
 
         # Step 4: GradNorm loss — L1 between weighted grad norms and targets.

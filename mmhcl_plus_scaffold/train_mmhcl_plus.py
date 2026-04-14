@@ -27,28 +27,29 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from mmhcl_plus.config import load_config
-from mmhcl_plus.model import LayerwiseEncoder, FusionMLP, ExpandedProjector, MMHCLPlus
 from mmhcl_plus.contrast import (
-    barlow_twins_loss,
-    chunked_info_nce_loss,
-    temperature_free_info_nce_loss,
-    soft_byol_alignment,
-    bpr_loss,
     GradNormLossBalancer,
+    barlow_twins_loss,
+    bpr_loss,
+    chunked_info_nce_loss,
+    soft_byol_alignment,
+    temperature_free_info_nce_loss,
 )
+from mmhcl_plus.model import ExpandedProjector, FusionMLP, LayerwiseEncoder, MMHCLPlus
 from mmhcl_plus.regularizers import dirichlet_energy_minibatch
-from mmhcl_plus.systems import profiling_guided_checkpoint
+from mmhcl_plus.systems import profiling_guided_checkpoint, to_device_async
 from mmhcl_plus.topology.dynamic_ema_weights import WEMAManager
 from mmhcl_plus.trainers import TwoStageTrainer
-from mmhcl_plus.utils import set_seed, count_parameters
-
+from mmhcl_plus.utils import count_parameters, set_seed
 
 # ---------------------------------------------------------------------------
 # Dummy components (replace with real MMHCL layers in production)
 # ---------------------------------------------------------------------------
 
+
 class DummyBranchLayer(nn.Module):
     """Residual-style dummy conv layer (stands in for a real hypergraph conv)."""
+
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.block = nn.Sequential(
@@ -68,6 +69,7 @@ class DummyDataset(Dataset):
     Each 'item' in the dataset is a single mini-batch dict (batch_size=128 nodes).
     The dataset returns 16 such batches per epoch (simulating ~2 000 users).
     """
+
     def __init__(self, n_nodes: int = 512, dim: int = 64) -> None:
         self.n_nodes = n_nodes
         self.dim = dim
@@ -97,13 +99,13 @@ class DummyDataset(Dataset):
             return (eye - block).to_sparse()
 
         return {
-            'x': x,
-            'pos_scores': pos_scores,
-            'neg_scores': neg_scores,
-            'node_idx': torch.arange(x.size(0)),
-            'lap_getter': lap_getter,
-            'user_idx': user_idx,
-            'item_idx': item_idx,
+            "x": x,
+            "pos_scores": pos_scores,
+            "neg_scores": neg_scores,
+            "node_idx": torch.arange(x.size(0)),
+            "lap_getter": lap_getter,
+            "user_idx": user_idx,
+            "item_idx": item_idx,
         }
 
 
@@ -115,6 +117,7 @@ def collate_single(batch: list) -> dict:
 # ---------------------------------------------------------------------------
 # Model factory
 # ---------------------------------------------------------------------------
+
 
 def build_demo_model(cfg) -> tuple[nn.Module, nn.Module]:
     """Build MMHCLPlus with DummyBranchLayer encoders."""
@@ -148,18 +151,20 @@ def build_demo_model(cfg) -> tuple[nn.Module, nn.Module]:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description='MMHCL+ demo trainer')
-    parser.add_argument('--config', type=str, default='configs/mmhcl_plus.yaml')
-    parser.add_argument('--temperature_free', action='store_true',
-                        help='Use temperature-free InfoNCE (τ=1) for the i2i branch')
+    parser = argparse.ArgumentParser(description="MMHCL+ demo trainer")
+    parser.add_argument("--config", type=str, default="configs/mmhcl_plus.yaml")
+    parser.add_argument(
+        "--temperature_free",
+        action="store_true",
+        help="Use temperature-free InfoNCE (τ=1) for the i2i branch",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     set_seed(cfg.system.seed)
-    device = torch.device(
-        cfg.system.device if torch.cuda.is_available() else 'cpu'
-    )
+    device = torch.device(cfg.system.device if torch.cuda.is_available() else "cpu")
 
     # ------------------------------------------------------------------
     # Build model
@@ -167,6 +172,13 @@ def main() -> None:
     model, projector = build_demo_model(cfg)
     model = model.to(device)
     projector = projector.to(device)
+
+    if getattr(cfg.system, "compile_projector", False) and hasattr(torch, "compile"):
+        try:
+            projector = torch.compile(projector, mode="reduce-overhead")
+            print("[train_mmhcl_plus] torch.compile(ExpandedProjector) enabled.")
+        except Exception as exc:
+            print(f"[train_mmhcl_plus] torch.compile(projector) skipped: {exc}")
 
     balancer = GradNormLossBalancer(alpha=cfg.loss.gradnorm_alpha).to(device)
 
@@ -204,25 +216,27 @@ def main() -> None:
     # Loss function registry
     # ------------------------------------------------------------------
     if args.temperature_free:
-        infonce_fn = lambda a, b, tau=None, dynamic_weights=None: (
-            temperature_free_info_nce_loss(a, b)
-        )
+
+        def infonce_fn(a, b, tau=None, dynamic_weights=None):
+            return temperature_free_info_nce_loss(a, b)
     else:
+
         def infonce_fn(a, b, tau=None, dynamic_weights=None):
             t = tau if tau is not None else cfg.loss.tau
             return chunked_info_nce_loss(
-                a, b,
+                a,
+                b,
                 tau=t,
                 chunk_size=cfg.loss.info_nce_chunk_size,
                 dynamic_weights=dynamic_weights,
             )
 
     loss_fns = {
-        'barlow': barlow_twins_loss,
-        'infonce': infonce_fn,
-        'soft_byol': soft_byol_alignment,
-        'bpr': bpr_loss,
-        'dirichlet': dirichlet_energy_minibatch,
+        "barlow": barlow_twins_loss,
+        "infonce": infonce_fn,
+        "soft_byol": soft_byol_alignment,
+        "bpr": bpr_loss,
+        "dirichlet": dirichlet_energy_minibatch,
     }
 
     # ------------------------------------------------------------------
@@ -248,17 +262,35 @@ def main() -> None:
     # Data
     # ------------------------------------------------------------------
     dataset = DummyDataset(n_nodes=n_nodes, dim=cfg.model.in_dim)
-    dataloader = DataLoader(
-        dataset, batch_size=1, shuffle=True, collate_fn=collate_single
+    nw = int(getattr(cfg.system, "dataloader_num_workers", 0))
+    dl_common = dict(
+        dataset=dataset,
+        batch_size=1,
+        shuffle=True,
+        collate_fn=collate_single,
     )
+    if nw > 0:
+        dataloader = DataLoader(
+            **dl_common,
+            num_workers=nw,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=True,
+            prefetch_factor=int(getattr(cfg.system, "dataloader_prefetch_factor", 2)),
+        )
+    else:
+        dataloader = DataLoader(**dl_common)
 
     print(
-        f'Model params: {count_parameters(model) + count_parameters(projector) + count_parameters(balancer):,}'
+        f"Model params: {count_parameters(model) + count_parameters(projector) + count_parameters(balancer):,}"
     )
-    print(f'Device: {device}  |  Warmup epochs: {cfg.loss.warmup_epochs}'
-          f'  |  Total epochs: {cfg.system.epochs}')
-    print(f'Temperature schedule: tau_max={cfg.loss.tau_max}, '
-          f'tau_min={cfg.loss.tau_min}, gamma={cfg.loss.tau_gamma}')
+    print(
+        f"Device: {device}  |  Warmup epochs: {cfg.loss.warmup_epochs}"
+        f"  |  Total epochs: {cfg.system.epochs}"
+    )
+    print(
+        f"Temperature schedule: tau_max={cfg.loss.tau_max}, "
+        f"tau_min={cfg.loss.tau_min}, gamma={cfg.loss.tau_gamma}"
+    )
     print()
 
     # ------------------------------------------------------------------
@@ -270,13 +302,7 @@ def main() -> None:
         epoch_metrics: dict[str, float] = {}
 
         for step, batch in enumerate(dataloader, start=1):
-            # Move tensors to device (lap_getter callable stays on CPU)
-            gpu_batch = {}
-            for k, v in batch.items():
-                if hasattr(v, 'to'):
-                    gpu_batch[k] = v.to(device, non_blocking=True)
-                else:
-                    gpu_batch[k] = v
+            gpu_batch = to_device_async(batch, device)
 
             metrics = trainer.train_step(
                 batch=gpu_batch,
@@ -289,9 +315,9 @@ def main() -> None:
                     epoch_metrics[k] = epoch_metrics.get(k, 0.0) + val
 
             if step % cfg.system.log_every == 0:
-                mode = 'WARMUP' if metrics['warmup'] else f"tau={metrics['tau']:.4f}"
+                mode = "WARMUP" if metrics["warmup"] else f"tau={metrics['tau']:.4f}"
                 print(
-                    f"epoch={epoch+1:3d}/{cfg.system.epochs} "
+                    f"epoch={epoch + 1:3d}/{cfg.system.epochs} "
                     f"step={step:2d} "
                     f"[{mode}] "
                     f"loss={metrics['loss']:.4f}  "
@@ -304,9 +330,9 @@ def main() -> None:
 
         n_steps = len(dataloader)
         print(
-            f"  >> epoch {epoch+1} avg: "
+            f"  >> epoch {epoch + 1} avg: "
             + "  ".join(
-                f"{k}={v/n_steps:.4f}"
+                f"{k}={v / n_steps:.4f}"
                 for k, v in epoch_metrics.items()
                 if isinstance(v, float)
             )
@@ -314,5 +340,5 @@ def main() -> None:
         print()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

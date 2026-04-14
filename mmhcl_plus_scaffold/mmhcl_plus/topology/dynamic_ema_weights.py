@@ -47,12 +47,55 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .faiss_index import ANNIndex
-
+from .faiss_index import HAS_FAISS, ANNIndex
 
 # ---------------------------------------------------------------------------
 # Standalone helpers (backward-compatible)
 # ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def neighbor_sets_from_raw_features(
+    raw_features_list: list[torch.Tensor],
+    ann_k: int,
+    ann_backend: str,
+) -> torch.Tensor | None:
+    """
+    k-NN indices per node for ``apply_soft_topology`` (Jaccard term).
+
+    FAISS GPU path (report Opt. 3): O(N) batched search vs full torch matmul.
+    ``ann_backend='torch'`` returns None — purification keeps cosine proxy (no extra O(N²)).
+    """
+    if ann_backend != "faiss" or not raw_features_list:
+        return None
+
+    feats_sum: torch.Tensor | None = None
+    for feats in raw_features_list:
+        n = F.normalize(feats.float().cpu(), p=2, dim=-1)
+        feats_sum = n if feats_sum is None else feats_sum + n
+    emb = feats_sum / max(len(raw_features_list), 1)
+    n_nodes, dim = emb.shape
+    if n_nodes <= 1 or ann_k <= 0:
+        return None
+
+    k_search = min(ann_k + 1, n_nodes)
+    index = ANNIndex(
+        dim,
+        metric="ip",
+        backend="faiss",
+        use_gpu=torch.cuda.is_available(),
+        fp16_store=True,
+    )
+    index.build(emb)
+    _, idx = index.search(emb, k_search)
+    if idx.size(1) <= 1:
+        return None
+    # Drop self (largest inner product on L2-normalised rows)
+    neighbors = idx[:, 1:].long().contiguous()
+    if neighbors.size(1) > ann_k:
+        neighbors = neighbors[:, :ann_k]
+    return neighbors.cpu()
+
 
 @torch.no_grad()
 def update_ema_teacher(
@@ -63,9 +106,12 @@ def update_ema_teacher(
     """Polyak / exponential moving-average update of teacher parameters.
 
     ξ ← β·ξ + (1-β)·θ     (Algorithm 1, Step 11 in TEX §4.4)
+
+    Uses ``lerp_`` (single fused kernel) per MMHCL+ Optimization Report — Opt. 5.
     """
+    beta = 1.0 - momentum
     for ps, pt in zip(student.parameters(), teacher.parameters()):
-        pt.data.mul_(momentum).add_(ps.data, alpha=1.0 - momentum)
+        pt.data.lerp_(ps.data, beta)
 
 
 @torch.no_grad()
@@ -81,6 +127,7 @@ def update_w_ema(
 # ---------------------------------------------------------------------------
 # User-feature builder
 # ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def build_user_features_from_interactions(
@@ -130,6 +177,7 @@ def build_user_features_from_interactions(
 # ---------------------------------------------------------------------------
 # WEMAManager — Two-tier W architecture + Soft Topology Purification
 # ---------------------------------------------------------------------------
+
 
 class WEMAManager:
     """
@@ -239,12 +287,12 @@ class WEMAManager:
 
         # 1. Percentile-based continuous relaxation
         thresh = torch.quantile(W_f, percentile, dim=-1, keepdim=True)  # [N, 1]
-        W_shifted = (W_f - thresh).clamp(min=0.0)                        # [N, N]
+        W_shifted = (W_f - thresh).clamp(min=0.0)  # [N, N]
 
         # 2. Jaccard-like term
         if neighbor_sets is not None and neighbor_sets.shape[0] == self.n_nodes:
             # Exact sampled Jaccard between k-NN sets
-            W_jaccard = _batch_jaccard(neighbor_sets, self.n_nodes)      # [N, N]
+            W_jaccard = _batch_jaccard(neighbor_sets, self.n_nodes)  # [N, N]
         else:
             # Fast proxy: cosine similarity already captures neighborhood overlap
             W_jaccard = W_f
@@ -253,11 +301,11 @@ class WEMAManager:
         if degrees is not None:
             deg = degrees.float().cpu().clamp(min=0.0)
         else:
-            deg = W_f.sum(dim=0)   # approximate degree from column sums
+            deg = W_f.sum(dim=0)  # approximate degree from column sums
         bridge_penalty = 1.0 / (1.0 + deg.log1p()).unsqueeze(0)  # [1, N]
 
         # 4. Combine and normalize per row
-        W_raw = W_shifted * W_jaccard * bridge_penalty           # [N, N]
+        W_raw = W_shifted * W_jaccard * bridge_penalty  # [N, N]
         W_soft = torch.softmax(W_raw / max(temp, 1e-6), dim=-1)  # [N, N]
 
         self.W = W_soft.half()
@@ -283,7 +331,7 @@ class WEMAManager:
             Float32 tensor of shape [len(idx), n_nodes].
         """
         rows = self.W[idx.cpu()].float()  # [B, N], fp32
-        if device is not None and str(device) != 'cpu':
+        if device is not None and str(device) != "cpu":
             rows = rows.pin_memory()
             rows = rows.to(device, non_blocking=True)
         return rows
@@ -338,6 +386,7 @@ class WEMAManager:
 # Internal helper — batch Jaccard computation
 # ---------------------------------------------------------------------------
 
+
 @torch.no_grad()
 def _batch_jaccard(neighbor_sets: torch.Tensor, n_nodes: int) -> torch.Tensor:
     """
@@ -362,15 +411,16 @@ def _batch_jaccard(neighbor_sets: torch.Tensor, n_nodes: int) -> torch.Tensor:
     for i in range(N):
         M[i, neighbor_sets[i]] = 1.0
 
-    dot = M @ M.T                        # [N, N]  intersection size
-    row_sum = M.sum(dim=1, keepdim=True) # [N, 1]  |N_i|
-    union = row_sum + row_sum.T - dot    # [N, N]  union size
+    dot = M @ M.T  # [N, N]  intersection size
+    row_sum = M.sum(dim=1, keepdim=True)  # [N, 1]  |N_i|
+    union = row_sum + row_sum.T - dot  # [N, N]  union size
     return dot / union.clamp_min(1.0)
 
 
 # ---------------------------------------------------------------------------
 # Convenience factory
 # ---------------------------------------------------------------------------
+
 
 def build_item_wema(
     n_items: int,
@@ -381,14 +431,17 @@ def build_item_wema(
     purification_temp: float = 0.2,
     item_degrees: torch.Tensor | None = None,
     logger=None,
+    ann_backend: str = "auto",
+    ann_k: int = 32,
 ) -> WEMAManager | None:
     """
     Build and initialise a WEMAManager for the item side.
 
     Returns None if no feature files are found.
     """
-    import numpy as np
     import os
+
+    import numpy as np
 
     raw_feats: list[torch.Tensor] = []
     for fp in item_feat_paths:
@@ -398,7 +451,7 @@ def build_item_wema(
         raw_feats.append(torch.from_numpy(arr)[:n_items])
         if logger:
             logger.logging(
-                "[WEMAManager] Loaded item features: %s  shape=%s" % (fp, arr.shape)
+                f"[WEMAManager] Loaded item features: {fp}  shape={arr.shape}"
             )
 
     if not raw_feats:
@@ -406,16 +459,23 @@ def build_item_wema(
 
     mgr = WEMAManager(n_nodes=n_items, alpha=alpha, update_interval=update_interval)
     mgr.precompute_from_raw(raw_feats)
+
+    resolved_ann = ann_backend
+    if resolved_ann == "auto":
+        resolved_ann = "faiss" if HAS_FAISS else "torch"
+    nbr = neighbor_sets_from_raw_features(raw_feats, ann_k, resolved_ann)
+
     mgr.apply_soft_topology(
         percentile=percentile,
         temp=purification_temp,
         degrees=item_degrees,
+        neighbor_sets=nbr,
     )
     if logger:
         logger.logging(
-            "[WEMAManager] Item W_ema ready: %d items, %d modalities, "
-            "alpha=%.2f, update_interval=%d, purification_percentile=%.2f"
-            % (n_items, len(raw_feats), alpha, update_interval, percentile)
+            f"[WEMAManager] Item W_ema ready: {n_items} items, {len(raw_feats)} modalities, "
+            f"alpha={alpha:.2f}, update_interval={update_interval}, "
+            f"purification_percentile={percentile:.2f}"
         )
     return mgr
 
@@ -431,6 +491,8 @@ def build_user_wema(
     purification_temp: float = 0.2,
     user_degrees: torch.Tensor | None = None,
     logger=None,
+    ann_backend: str = "auto",
+    ann_k: int = 32,
 ) -> WEMAManager | None:
     """
     Build and initialise a WEMAManager for the user side.
@@ -440,8 +502,9 @@ def build_user_wema(
 
     Returns None if no feature files are found.
     """
-    import numpy as np
     import os
+
+    import numpy as np
 
     item_feat_list: list[torch.Tensor] = []
     for fp in item_feat_paths:
@@ -452,7 +515,7 @@ def build_user_wema(
         if logger:
             logger.logging(
                 "[WEMAManager-user] Loaded item features for user pooling: "
-                "%s  shape=%s" % (fp, arr.shape)
+                f"{fp}  shape={arr.shape}"
             )
 
     if not item_feat_list:
@@ -464,15 +527,21 @@ def build_user_wema(
 
     mgr = WEMAManager(n_nodes=n_users, alpha=alpha, update_interval=update_interval)
     mgr.precompute_from_raw(user_feats)
+
+    resolved_ann = ann_backend
+    if resolved_ann == "auto":
+        resolved_ann = "faiss" if HAS_FAISS else "torch"
+    nbr = neighbor_sets_from_raw_features(user_feats, ann_k, resolved_ann)
+
     mgr.apply_soft_topology(
         percentile=percentile,
         temp=purification_temp,
         degrees=user_degrees,
+        neighbor_sets=nbr,
     )
     if logger:
         logger.logging(
-            "[WEMAManager-user] User W_ema ready: %d users, alpha=%.2f, "
-            "update_interval=%d, purification_percentile=%.2f"
-            % (n_users, alpha, update_interval, percentile)
+            f"[WEMAManager-user] User W_ema ready: {n_users} users, alpha={alpha:.2f}, "
+            f"update_interval={update_interval}, purification_percentile={percentile:.2f}"
         )
     return mgr

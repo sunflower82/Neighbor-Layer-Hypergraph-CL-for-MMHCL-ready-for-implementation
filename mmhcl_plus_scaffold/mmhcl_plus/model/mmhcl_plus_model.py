@@ -1,5 +1,7 @@
 import copy
+
 import torch.nn as nn
+
 
 class MMHCLPlus(nn.Module):
     def __init__(self, hyper_encoder, bip_encoder, fusion, projector_u2u):
@@ -17,9 +19,9 @@ class MMHCLPlus(nn.Module):
         h_bip, bip_embs = self.bip_encoder(h0, checkpoint_fn)
         h_fused = self.fusion(h_hyper, h_bip)
         return {
-            'h_fused': h_fused,
-            'hyper_final': h_hyper,
-            'bip_final': h_bip,
-            'hyper_layers': hyper_embs,
-            'bip_layers': bip_embs,
+            "h_fused": h_fused,
+            "hyper_final": h_hyper,
+            "bip_final": h_bip,
+            "hyper_layers": hyper_embs,
+            "bip_layers": bip_embs,
         }

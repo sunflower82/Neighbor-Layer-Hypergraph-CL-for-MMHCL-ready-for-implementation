@@ -43,21 +43,12 @@ Reference:
 
 from __future__ import annotations
 
-import os
 import argparse
-from typing import Callable
-
-import numpy as np
-from time import time
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-import copy
-
 from utility.parser import parse_args
-from utility.norm import build_sim, build_knn_normalized_graph
 
 args: argparse.Namespace = parse_args()
 
@@ -155,14 +146,18 @@ class MMHCL(nn.Module):
     """
 
     def __init__(self, n_users: int, n_items: int, embedding_dim: int) -> None:
-        super(MMHCL, self).__init__()
+        super().__init__()
         self.n_users: int = n_users
         self.n_items: int = n_items
         self.embeddings_dim: int = embedding_dim
 
         # ---- CF branch embeddings (for the user-item bipartite graph) ----
-        self.user_ui_embedding: nn.Embedding = nn.Embedding(n_users, self.embeddings_dim)
-        self.item_ui_embedding: nn.Embedding = nn.Embedding(n_items, self.embeddings_dim)
+        self.user_ui_embedding: nn.Embedding = nn.Embedding(
+            n_users, self.embeddings_dim
+        )
+        self.item_ui_embedding: nn.Embedding = nn.Embedding(
+            n_items, self.embeddings_dim
+        )
 
         # ---- Hypergraph branch embeddings (separate from CF embeddings) ----
         # uu_embedding : propagated on the user-user co-interaction graph
@@ -172,7 +167,7 @@ class MMHCL(nn.Module):
 
         # ---- Optional NGCF layers (only used if cf_model == 'NGCF') ----
         # NGCF adds linear transformations + bi-linear interactions per layer
-        if args.cf_model == 'NGCF':
+        if args.cf_model == "NGCF":
             self.GC_Linear_list: nn.ModuleList = nn.ModuleList()
             self.Bi_Linear_list: nn.ModuleList = nn.ModuleList()
             self.dropout_list: nn.ModuleList = nn.ModuleList()
@@ -222,8 +217,8 @@ class MMHCL(nn.Module):
         # =====================================================================
         # (A) Hypergraph branch: propagate through I2I and U2U graphs
         # =====================================================================
-        ii_emb: torch.Tensor = self.ii_embedding.weight   # (n_items, emb_dim)
-        uu_emb: torch.Tensor = self.uu_embedding.weight   # (n_users, emb_dim)
+        ii_emb: torch.Tensor = self.ii_embedding.weight  # (n_items, emb_dim)
+        uu_emb: torch.Tensor = self.uu_embedding.weight  # (n_users, emb_dim)
 
         # Item hypergraph propagation: stack `Item_layers` GNN layers
         if args.item_loss_ratio != 0:
@@ -241,7 +236,7 @@ class MMHCL(nn.Module):
         u_ui_emb: torch.Tensor
         i_ui_emb: torch.Tensor
 
-        if args.cf_model == 'LightGCN':
+        if args.cf_model == "LightGCN":
             # ----- LightGCN: no weights, no activation -----
             ego_embeddings: torch.Tensor = torch.cat(
                 (self.user_ui_embedding.weight, self.item_ui_embedding.weight), dim=0
@@ -261,7 +256,7 @@ class MMHCL(nn.Module):
                 all_embeddings_mean, [self.n_users, self.n_items], dim=0
             )
 
-        elif args.cf_model == 'NGCF':
+        elif args.cf_model == "NGCF":
             # ----- NGCF: adds feature transformation + bi-linear interaction -----
             ego_embeddings = torch.cat(
                 (self.user_ui_embedding.weight, self.item_ui_embedding.weight), dim=0
@@ -286,7 +281,7 @@ class MMHCL(nn.Module):
                 all_embeddings_mean, [self.n_users, self.n_items], dim=0
             )
 
-        elif args.cf_model == 'MF':
+        elif args.cf_model == "MF":
             # ----- Matrix Factorisation baseline: no graph propagation -----
             u_ui_emb = self.user_ui_embedding.weight
             i_ui_emb = self.item_ui_embedding.weight
@@ -327,26 +322,33 @@ class MMHCL(nn.Module):
         num_batches: int = (num_nodes - 1) // batch_size + 1
 
         # Temperature-scaled exponential: f(x) = exp(x / τ)
-        f: Callable[[torch.Tensor], torch.Tensor] = lambda x: torch.exp(x / self.tau)
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x / self.tau)
+
         indices: torch.Tensor = torch.arange(0, num_nodes).to(device)
         losses: list[torch.Tensor] = []
 
         for i in range(num_batches):
             # Select a batch of anchor nodes
-            mask: torch.Tensor = indices[i * batch_size:(i + 1) * batch_size]
+            mask: torch.Tensor = indices[i * batch_size : (i + 1) * batch_size]
 
             # refl_sim[a, b] = exp( sim(z1[anchor_a], z1[b]) / τ )
-            refl_sim: torch.Tensor = f(self.sim(z1[mask], z1))      # (B, N)
+            refl_sim: torch.Tensor = f(self.sim(z1[mask], z1))  # (B, N)
 
             # between_sim[a, b] = exp( sim(z1[anchor_a], z2[b]) / τ )
-            between_sim: torch.Tensor = f(self.sim(z1[mask], z2))    # (B, N)
+            between_sim: torch.Tensor = f(self.sim(z1[mask], z2))  # (B, N)
 
             # InfoNCE: positive pair is the diagonal (same index in z2)
-            losses.append(-torch.log(
-                between_sim[:, i * batch_size:(i + 1) * batch_size].diag()
-                / (refl_sim.sum(1) + between_sim.sum(1)
-                   - refl_sim[:, i * batch_size:(i + 1) * batch_size].diag())
-            ))
+            losses.append(
+                -torch.log(
+                    between_sim[:, i * batch_size : (i + 1) * batch_size].diag()
+                    / (
+                        refl_sim.sum(1)
+                        + between_sim.sum(1)
+                        - refl_sim[:, i * batch_size : (i + 1) * batch_size].diag()
+                    )
+                )
+            )
 
         loss_vec: torch.Tensor = torch.cat(losses)
         return loss_vec.mean()
@@ -362,6 +364,6 @@ class MMHCL(nn.Module):
         Returns:
             (B, N) matrix of cosine similarities.
         """
-        z1 = F.normalize(z1)   # L2-normalise each row
+        z1 = F.normalize(z1)  # L2-normalise each row
         z2 = F.normalize(z2)
         return torch.mm(z1, z2.t())

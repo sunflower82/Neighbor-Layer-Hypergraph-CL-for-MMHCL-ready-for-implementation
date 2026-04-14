@@ -36,13 +36,14 @@ EMA teacher refresh (TEX §4.2):
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
 
 import torch
+from torch.amp import GradScaler, autocast
 import torch.nn as nn
 
 from ..contrast.neighbor_pairs import build_neighbor_layer_pairs
-from ..topology.dynamic_ema_weights import update_ema_teacher, WEMAManager
+from ..topology.dynamic_ema_weights import WEMAManager, update_ema_teacher
 
 
 class TwoStageTrainer:
@@ -69,8 +70,8 @@ class TwoStageTrainer:
         balancer: nn.Module,
         cfg,
         projector: nn.Module,
-        w_ema_u: Optional[WEMAManager] = None,
-        w_ema_i: Optional[WEMAManager] = None,
+        w_ema_u: WEMAManager | None = None,
+        w_ema_i: WEMAManager | None = None,
     ) -> None:
         self.model = model
         self.optimizer = optimizer
@@ -80,6 +81,18 @@ class TwoStageTrainer:
         self.w_ema_u = w_ema_u
         self.w_ema_i = w_ema_i
         self._epoch: int = 0
+
+        sys_cfg = getattr(cfg, "system", None)
+        amp = getattr(sys_cfg, "amp_dtype", "off") if sys_cfg is not None else "off"
+        self._amp_enabled: bool = amp in ("bf16", "fp16") and torch.cuda.is_available()
+        self._amp_dtype: torch.dtype = (
+            torch.bfloat16 if amp == "bf16" else torch.float16
+        )
+        self._use_grad_scaler: bool = amp == "fp16" and torch.cuda.is_available()
+        self._scaler = GradScaler("cuda", enabled=self._use_grad_scaler)
+        self._grad_clip: float = float(
+            getattr(sys_cfg, "grad_clip_max_norm", 1.0) if sys_cfg is not None else 1.0
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -95,13 +108,13 @@ class TwoStageTrainer:
             τ(t) = max(τ_min,  τ_max · γ^t)
         """
         lc = self.cfg.loss
-        tau_max = getattr(lc, 'tau_max', lc.tau)
-        tau_min = getattr(lc, 'tau_min', 0.05)
-        tau_gamma = getattr(lc, 'tau_gamma', 0.99)
-        return max(tau_min, tau_max * (tau_gamma ** self._epoch))
+        tau_max = getattr(lc, "tau_max", lc.tau)
+        tau_min = getattr(lc, "tau_min", 0.05)
+        tau_gamma = getattr(lc, "tau_gamma", 0.99)
+        return max(tau_min, tau_max * (tau_gamma**self._epoch))
 
     def _in_warmup(self) -> bool:
-        warmup = getattr(self.cfg.loss, 'warmup_epochs', 0)
+        warmup = getattr(self.cfg.loss, "warmup_epochs", 0)
         return self._epoch < warmup
 
     # ------------------------------------------------------------------
@@ -110,10 +123,10 @@ class TwoStageTrainer:
 
     def train_step(
         self,
-        batch: Dict[str, object],
-        checkpoint_fn: Optional[Callable],
-        loss_fns: Dict[str, Callable],
-    ) -> Dict[str, float]:
+        batch: dict[str, object],
+        checkpoint_fn: Callable | None,
+        loss_fns: dict[str, Callable],
+    ) -> dict[str, float]:
         """
         Execute one mini-batch step (forward → losses → backward → update).
 
@@ -134,118 +147,102 @@ class TwoStageTrainer:
         self.projector.train()
 
         device = next(self.model.parameters()).device
+        amp_dev = "cuda" if device.type == "cuda" else "cpu"
 
         # ----------------------------------------------------------------
-        # Forward pass through both branches
+        # Forward + CL + BPR + alignment under autocast (report Opt. 2).
+        # Dirichlet trace is computed *outside* autocast for numerical stability.
         # ----------------------------------------------------------------
-        out = self.model(batch['x'], checkpoint_fn)
+        with autocast(
+            device_type=amp_dev,
+            dtype=self._amp_dtype,
+            enabled=self._amp_enabled,
+        ):
+            out = self.model(batch["x"], checkpoint_fn)
 
-        # ----------------------------------------------------------------
-        # Stage 1: Intra-branch Contrastive Learning (skipped during warmup)
-        # ----------------------------------------------------------------
-        loss_u = out['hyper_final'].new_tensor(0.0)
-        loss_i = out['bip_final'].new_tensor(0.0)
+            loss_u = out["hyper_final"].new_tensor(0.0)
+            loss_i = out["bip_final"].new_tensor(0.0)
 
-        if not self._in_warmup():
-            tau = self.current_tau()
+            if not self._in_warmup():
+                tau = self.current_tau()
 
-            u_pairs = build_neighbor_layer_pairs(
-                out['hyper_layers'], max_hops=self.cfg.model.max_g_layers
-            )
-            i_pairs = build_neighbor_layer_pairs(
-                out['bip_layers'], max_hops=self.cfg.model.max_g_layers
-            )
-
-            # -- u2u branch: Barlow Twins + Expanded Projector + ASW --
-            #
-            # Two distinct index types are at play:
-            #   user_idx (global) — node IDs in the full graph, used for W_ema lookup.
-            #   local_u           — row positions within the current batch embedding,
-            #                       always arange(n_u) assuming batch = [users | items].
-            #
-            # In a full MMHCL integration the u2u encoder already outputs user-only
-            # embeddings, so no slicing is needed.  The demo encoder processes all
-            # batch nodes, so we take the first n_u rows as the user subset.
-            u_terms: list[torch.Tensor] = []
-            user_idx = batch.get('user_idx')
-            n_u = user_idx.numel() if user_idx is not None else None
-            for a, b in u_pairs:
-                if n_u is not None and n_u < a.size(0):
-                    a_u, b_u = a[:n_u], b[:n_u]   # first n_u rows = users
-                else:
-                    a_u, b_u = a, b
-
-                soft_w = None
-                if self.w_ema_u is not None and user_idx is not None:
-                    w_rows = self.w_ema_u.get_batch_weights(user_idx, device=device)
-                    soft_w = w_rows.mean(dim=-1)  # [n_u] scalar importance per user
-
-                u_terms.append(
-                    loss_fns['barlow'](
-                        self.projector(a_u),
-                        self.projector(b_u),
-                        lambd=self.cfg.loss.barlow_lambda,
-                        soft_weights=soft_w,
-                    )
+                u_pairs = build_neighbor_layer_pairs(
+                    out["hyper_layers"], max_hops=self.cfg.model.max_g_layers
                 )
-            if u_terms:
-                loss_u = torch.stack(u_terms).mean()
-
-            # -- i2i branch: Chunked InfoNCE + dynamic weights + temperature --
-            #
-            # Similarly, item_idx are global IDs; local item rows are the tail of
-            # the batch after n_u user rows.
-            i_terms: list[torch.Tensor] = []
-            item_idx = batch.get('item_idx')
-            n_i = item_idx.numel() if item_idx is not None else None
-            n_u_off = n_u if n_u is not None else 0
-            for a, b in i_pairs:
-                if n_i is not None and (n_u_off + n_i) <= a.size(0):
-                    a_i = a[n_u_off: n_u_off + n_i]
-                    b_i = b[n_u_off: n_u_off + n_i]
-                else:
-                    a_i, b_i = a, b
-
-                dyn_w = None
-                if self.w_ema_i is not None and item_idx is not None:
-                    # W_ema rows: [n_i, N].  We need the item×item subblock [n_i, n_i]
-                    # matching the logit shape [n_i, n_keys=n_i].
-                    w_full = self.w_ema_i.get_batch_weights(item_idx, device=device)
-                    col_idx = item_idx.cpu().long()
-                    if col_idx.max() < w_full.size(1):
-                        dyn_w = w_full[:, col_idx].to(device)  # [n_i, n_i]
-                    if dyn_w is not None and dyn_w.size(0) != a_i.size(0):
-                        dyn_w = None  # final safety guard
-
-                i_terms.append(
-                    loss_fns['infonce'](
-                        a_i,
-                        b_i,
-                        tau=tau,
-                        dynamic_weights=dyn_w,
-                    )
+                i_pairs = build_neighbor_layer_pairs(
+                    out["bip_layers"], max_hops=self.cfg.model.max_g_layers
                 )
-            if i_terms:
-                loss_i = torch.stack(i_terms).mean()
 
-        # ----------------------------------------------------------------
-        # Stage 2: Cross-branch Alignment (Soft BYOL)
-        # ----------------------------------------------------------------
-        align_weights = batch.get('align_weights')
-        loss_align = loss_fns['soft_byol'](
-            out['hyper_final'], out['bip_final'], align_weights
-        )
+                # -- u2u branch: Barlow Twins + Expanded Projector + ASW --
+                u_terms: list[torch.Tensor] = []
+                user_idx = batch.get("user_idx")
+                n_u = user_idx.numel() if user_idx is not None else None
+                for a, b in u_pairs:
+                    if n_u is not None and n_u < a.size(0):
+                        a_u, b_u = a[:n_u], b[:n_u]
+                    else:
+                        a_u, b_u = a, b
 
-        # ----------------------------------------------------------------
-        # BPR recommendation loss
-        # ----------------------------------------------------------------
-        loss_bpr = loss_fns['bpr'](batch['pos_scores'], batch['neg_scores'])
+                    soft_w = None
+                    if self.w_ema_u is not None and user_idx is not None:
+                        w_rows = self.w_ema_u.get_batch_weights(user_idx, device=device)
+                        soft_w = w_rows.mean(dim=-1)
+
+                    u_terms.append(
+                        loss_fns["barlow"](
+                            self.projector(a_u),
+                            self.projector(b_u),
+                            lambd=self.cfg.loss.barlow_lambda,
+                            soft_weights=soft_w,
+                        )
+                    )
+                if u_terms:
+                    loss_u = torch.stack(u_terms).mean()
+
+                # -- i2i branch: Chunked InfoNCE + dynamic weights + temperature --
+                i_terms: list[torch.Tensor] = []
+                item_idx = batch.get("item_idx")
+                n_i = item_idx.numel() if item_idx is not None else None
+                n_u_off = n_u if n_u is not None else 0
+                for a, b in i_pairs:
+                    if n_i is not None and (n_u_off + n_i) <= a.size(0):
+                        a_i = a[n_u_off : n_u_off + n_i]
+                        b_i = b[n_u_off : n_u_off + n_i]
+                    else:
+                        a_i, b_i = a, b
+
+                    dyn_w = None
+                    if self.w_ema_i is not None and item_idx is not None:
+                        w_full = self.w_ema_i.get_batch_weights(item_idx, device=device)
+                        col_idx = item_idx.cpu().long()
+                        if col_idx.max() < w_full.size(1):
+                            dyn_w = w_full[:, col_idx].to(device)
+                        if dyn_w is not None and dyn_w.size(0) != a_i.size(0):
+                            dyn_w = None
+
+                    i_terms.append(
+                        loss_fns["infonce"](
+                            a_i,
+                            b_i,
+                            tau=tau,
+                            dynamic_weights=dyn_w,
+                        )
+                    )
+                if i_terms:
+                    loss_i = torch.stack(i_terms).mean()
+
+            align_weights = batch.get("align_weights")
+            loss_align = loss_fns["soft_byol"](
+                out["hyper_final"], out["bip_final"], align_weights
+            )
+
+            loss_bpr = loss_fns["bpr"](batch["pos_scores"], batch["neg_scores"])
 
         # ----------------------------------------------------------------
         # Dirichlet energy regularisation (anti-over-smoothing)
         # ----------------------------------------------------------------
-        loss_dir = loss_fns['dirichlet'](
-            out['hyper_final'], batch['node_idx'], batch['lap_getter']
+        loss_dir = loss_fns["dirichlet"](
+            out["hyper_final"], batch["node_idx"], batch["lap_getter"]
         )
 
         # ----------------------------------------------------------------
@@ -261,11 +258,23 @@ class TwoStageTrainer:
         total, grad_weights = self.balancer.combine(weighted_losses)
 
         # ----------------------------------------------------------------
-        # Backward + parameter update
+        # Backward + grad clip (report Opt. 6) + parameter update
         # ----------------------------------------------------------------
         self.optimizer.zero_grad(set_to_none=True)
-        total.backward()
-        self.optimizer.step()
+        opt_params = [p for g in self.optimizer.param_groups for p in g["params"]]
+
+        if self._use_grad_scaler:
+            self._scaler.scale(total).backward()
+            if self._grad_clip > 0:
+                self._scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(opt_params, self._grad_clip)
+            self._scaler.step(self.optimizer)
+            self._scaler.update()
+        else:
+            total.backward()
+            if self._grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(opt_params, self._grad_clip)
+            self.optimizer.step()
 
         # ----------------------------------------------------------------
         # EMA teacher refresh (BYOL-style momentum update)
@@ -282,32 +291,36 @@ class TwoStageTrainer:
         # W_ema lazy update — embeddings passed to step_update MUST have the same
         # number of rows as idx.  The caller organises the batch as [users | items],
         # so we take the first n_u rows for users and the rest for items.
-        u_idx = batch.get('user_idx')
+        u_idx = batch.get("user_idx")
         if self.w_ema_u is not None and u_idx is not None:
             n_u = u_idx.numel()
-            h_full = out['hyper_final']
+            h_full = out["hyper_final"]
             h_u = h_full[:n_u] if n_u <= h_full.size(0) else h_full
             if h_u.size(0) == n_u:
                 self.w_ema_u.step_update(h_u.detach(), u_idx, self._epoch)
 
-        i_idx = batch.get('item_idx')
+        i_idx = batch.get("item_idx")
         if self.w_ema_i is not None and i_idx is not None:
             n_i = i_idx.numel()
-            h_full = out['bip_final']
+            h_full = out["bip_final"]
             # Items occupy the tail of the batch after users
             n_u_offset = u_idx.numel() if u_idx is not None else 0
-            h_i = h_full[n_u_offset: n_u_offset + n_i] if (n_u_offset + n_i) <= h_full.size(0) else h_full
+            h_i = (
+                h_full[n_u_offset : n_u_offset + n_i]
+                if (n_u_offset + n_i) <= h_full.size(0)
+                else h_full
+            )
             if h_i.size(0) == n_i:
                 self.w_ema_i.step_update(h_i.detach(), i_idx, self._epoch)
 
         return {
-            'loss': float(total.detach().cpu()),
-            'bpr': float(loss_bpr.detach().cpu()),
-            'u2u': float(loss_u.detach().cpu()),
-            'i2i': float(loss_i.detach().cpu()),
-            'align': float(loss_align.detach().cpu()),
-            'dir': float(loss_dir.detach().cpu()),
-            'tau': self.current_tau(),
-            'warmup': self._in_warmup(),
-            'grad_weights': grad_weights.cpu().tolist(),
+            "loss": float(total.detach().cpu()),
+            "bpr": float(loss_bpr.detach().cpu()),
+            "u2u": float(loss_u.detach().cpu()),
+            "i2i": float(loss_i.detach().cpu()),
+            "align": float(loss_align.detach().cpu()),
+            "dir": float(loss_dir.detach().cpu()),
+            "tau": self.current_tau(),
+            "warmup": self._in_warmup(),
+            "grad_weights": grad_weights.cpu().tolist(),
         }

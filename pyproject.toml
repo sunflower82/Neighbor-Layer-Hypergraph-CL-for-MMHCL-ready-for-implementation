@@ -1,0 +1,65 @@
+# Ruff: formatting and lint aligned with https://google.github.io/styleguide/pyguide.html
+# (PEP 8 + import grouping; line length set to 88 for readability in ML code.)
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "wandb",
+    "*.egg-info",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (Google import order)
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length; formatter wraps where practical
+    "E402",  # imports not at top (common in training entrypoints)
+]
+
+# Notebooks are executed cell-by-cell; rules that assume a single module break on .ipynb.
+[tool.ruff.lint.per-file-ignores]
+"**/*.ipynb" = [
+    "E722",  # bare except: common in ad-hoc notebook cells
+    "E741",  # ambiguous name: legacy one-letter loop vars in data snippets
+    "F401",  # unused imports: exploratory cells
+    "F404",  # from __future__ not at file start: each cell is not a full file
+    "F811",  # redefinition: cells re-run standalone
+    "F841",  # unused variables in scratch cells
+]
+"codes/main.py" = [
+    "F403",  # star import from utility.batch_test (legacy MMHCL entrypoint)
+    "F405",  # names from star import used below
+]
+"codes/main_mmhcl_plus.py" = [
+    "F403",
+    "F405",
+]
+# Package barrels: symbols are re-exported for `from mmhcl_plus.foo import Bar`.
+"mmhcl_plus_scaffold/mmhcl_plus/**/__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+force-single-line = false
+force-sort-within-sections = true
+known-first-party = ["codes", "mmhcl_plus"]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "first-party",
+    "local-folder",
+]

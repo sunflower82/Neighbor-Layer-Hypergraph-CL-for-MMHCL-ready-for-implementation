@@ -28,36 +28,28 @@ Reference:
 
 from __future__ import annotations
 
-from datetime import datetime
+import argparse
+import copy
+import gc
 import math
 import os
+import pathlib
 import random
-import sys
 from time import time
-from tqdm import tqdm
-import json
-import copy
-import argparse
-from typing import Any, Optional, Union
-
-import numpy as np
-import numpy.typing as npt
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import torch.sparse as sparse
-import scipy.sparse as sp
-
-from utility.parser import parse_args
+from typing import Any
 
 from Models import MMHCL
+import numpy as np
+import numpy.typing as npt
+import scipy.sparse as sp
 
-from utility.batch_test import *          # also creates `data_generator` (global)
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from utility.batch_test import *  # also creates `data_generator` (global)
 from utility.logging import Logger
-import gc
-import pathlib
+from utility.parser import parse_args
 
 # Type alias for metric result dictionaries
 MetricsDict = dict[str, Any]
@@ -75,6 +67,7 @@ wandb: Any = None
 if args.use_wandb:
     try:
         import wandb as _wandb
+
         wandb = _wandb
     except ImportError:
         print("[WARNING] wandb not installed. Disabling W&B logging.")
@@ -106,7 +99,7 @@ def _build_paths(a: argparse.Namespace) -> tuple[str, str, str]:
 # ===========================================================================
 #  Trainer — the main class that owns the model, optimizer, and training loop
 # ===========================================================================
-class Trainer(object):
+class Trainer:
     """
     Encapsulates:
         - Model initialisation (MMHCL on GPU)
@@ -133,30 +126,33 @@ class Trainer(object):
         self.optuna_trial: Any = optuna_trial
 
         # --- dataset dimensions ---
-        self.n_users: int = data_config['n_users']
-        self.n_items: int = data_config['n_items']
+        self.n_users: int = data_config["n_users"]
+        self.n_items: int = data_config["n_items"]
 
         # --- logger (writes to both per-run and aggregated directories) ---
         self.logger: Logger = Logger(
-            path, is_debug=args.debug, target=path_name,
-            path2=record_path, ablation_target=args.ablation_target
+            path,
+            is_debug=args.debug,
+            target=path_name,
+            path2=record_path,
+            ablation_target=args.ablation_target,
         )
-        self.logger.logging("PID: %d" % os.getpid())
+        self.logger.logging(f"PID: {os.getpid()}")
         self.logger.logging(str(args))
 
         # --- store frequently-used hyperparameters ---
-        self.lr: float = args.lr                           # initial learning rate
-        self.emb_dim: int = args.embed_size                # embedding dimensionality
-        self.batch_size: int = args.batch_size             # BPR training batch size
+        self.lr: float = args.lr  # initial learning rate
+        self.emb_dim: int = args.embed_size  # embedding dimensionality
+        self.batch_size: int = args.batch_size  # BPR training batch size
         self.weight_size: list[int] = eval(args.weight_size)  # per-layer sizes
-        self.n_layers: int = len(self.weight_size)         # number of GNN layers
-        self.regs: float = args.regs                       # L2 regularisation coefficient
-        self.decay: float = self.regs                      # alias used in bpr_loss()
+        self.n_layers: int = len(self.weight_size)  # number of GNN layers
+        self.regs: float = args.regs  # L2 regularisation coefficient
+        self.decay: float = self.regs  # alias used in bpr_loss()
 
         # --- move the three adjacency matrices to GPU ---
-        self.UI_mat: torch.Tensor = data_config['UI_mat'].cuda()
-        self.User_mat: torch.Tensor = data_config['User_mat'].cuda()
-        self.Item_mat: torch.Tensor = data_config['Item_mat'].cuda()
+        self.UI_mat: torch.Tensor = data_config["UI_mat"].cuda()
+        self.User_mat: torch.Tensor = data_config["User_mat"].cuda()
+        self.Item_mat: torch.Tensor = data_config["Item_mat"].cuda()
 
         # --- instantiate the MMHCL model and move to GPU ---
         self.model: MMHCL = MMHCL(self.n_users, self.n_items, self.emb_dim)
@@ -165,7 +161,7 @@ class Trainer(object):
         # --- optimizer and learning-rate schedulers ---
         self.optimizer: optim.Adam = optim.Adam(self.model.parameters(), lr=self.lr)
         self.lr_scheduler: optim.lr_scheduler.LambdaLR = self.set_lr_scheduler()
-        self.reduce_lr_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = (
+        self.reduce_lr_scheduler: optim.lr_scheduler.ReduceLROnPlateau | None = (
             self.set_reduce_lr_scheduler() if args.use_reduce_lr else None
         )
 
@@ -179,7 +175,10 @@ class Trainer(object):
         This provides a smooth, gradual decay — after 50 epochs the LR is
         multiplied by 0.96, after 100 epochs by 0.96^2 ≈ 0.922, etc.
         """
-        fac = lambda epoch: 0.96 ** (epoch / 50)
+
+        def fac(epoch):
+            return 0.96 ** (epoch / 50)
+
         scheduler: optim.lr_scheduler.LambdaLR = optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=fac
         )
@@ -254,31 +253,29 @@ class Trainer(object):
         ndcg_loger: list[npt.NDArray[np.floating]] = []
         hit_loger: list[npt.NDArray[np.floating]] = []
         stopping_step: int = 0
-        should_stop: bool = False
-        cur_best_pre_0: float = 0.
 
         # n_batch = how many mini-batches per epoch
         n_batch: int = data_generator.n_train // args.batch_size + 1
-        best_recall: float = 0.         # best validation recall@20 seen so far
-        best_ndcg: float = 0.           # best validation ndcg@20 seen so far
-        best_val_recall: float = 0.     # tracked for Optuna return value
-        best_model_state: Optional[dict[str, Any]] = None
-        test_ret: Union[str, MetricsDict] = ""
-        eval_step: int = 0              # counter for Optuna intermediate reports
+        best_recall: float = 0.0  # best validation recall@20 seen so far
+        best_ndcg: float = 0.0  # best validation ndcg@20 seen so far
+        best_val_recall: float = 0.0  # tracked for Optuna return value
+        best_model_state: dict[str, Any] | None = None
+        test_ret: str | MetricsDict = ""
+        eval_step: int = 0  # counter for Optuna intermediate reports
 
         # ===== Initialise W&B run (if enabled) =====
         if args.use_wandb and wandb is not None:
             wandb_config: dict[str, Any] = vars(args)
-            wandb_config['path_name'] = path_name
+            wandb_config["path_name"] = path_name
             wandb_init_kwargs: dict[str, Any] = {
-                'project': args.wandb_project,
-                'config': wandb_config,
-                'reinit': True,
+                "project": args.wandb_project,
+                "config": wandb_config,
+                "reinit": True,
             }
             if args.wandb_entity:
-                wandb_init_kwargs['entity'] = args.wandb_entity
+                wandb_init_kwargs["entity"] = args.wandb_entity
             if args.wandb_run_name:
-                wandb_init_kwargs['name'] = args.wandb_run_name
+                wandb_init_kwargs["name"] = args.wandb_run_name
             wandb.init(**wandb_init_kwargs)
             self.logger.logging(f"W&B run initialized: {wandb.run.name}")
 
@@ -286,13 +283,13 @@ class Trainer(object):
         for epoch in range(args.epoch):
             t1: float = time()
             # Accumulators for epoch-level loss components
-            loss: float = 0.
-            mf_loss: float = 0.
-            emb_loss: float = 0.
-            reg_loss: float = 0.
-            contrastive_loss: float = 0.
+            loss: float = 0.0
+            mf_loss: float = 0.0
+            emb_loss: float = 0.0
+            reg_loss: float = 0.0
+            contrastive_loss: float = 0.0
             n_batch = data_generator.n_train // args.batch_size + 1
-            sample_time: float = 0.
+            sample_time: float = 0.0
 
             # ----- Mini-batch loop within one epoch -----
             for idx in range(n_batch):
@@ -346,8 +343,10 @@ class Trainer(object):
 
                 # (5) Total loss = BPR + regularisation + contrastive
                 batch_loss: torch.Tensor = (
-                    batch_mf_loss + batch_emb_loss
-                    + batch_reg_loss + batch_contrastive_loss
+                    batch_mf_loss
+                    + batch_emb_loss
+                    + batch_reg_loss
+                    + batch_contrastive_loss
                 )
 
                 # (6) Back-propagation and parameter update
@@ -371,28 +370,29 @@ class Trainer(object):
 
             # ----- NaN guard -----
             if math.isnan(loss):
-                self.logger.logging('ERROR: loss is nan.')
+                self.logger.logging("ERROR: loss is nan.")
                 if args.use_wandb and wandb is not None:
                     wandb.finish(exit_code=1)
                 return 0.0
 
             # ----- W&B: log training loss every epoch -----
             if args.use_wandb and wandb is not None:
-                wandb.log({
-                    'epoch': epoch,
-                    'train/loss': loss,
-                    'train/mf_loss': mf_loss,
-                    'train/emb_loss': emb_loss,
-                    'train/contrastive_loss': contrastive_loss,
-                    'train/lr': self.optimizer.param_groups[0]['lr'],
-                })
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train/loss": loss,
+                        "train/mf_loss": mf_loss,
+                        "train/emb_loss": emb_loss,
+                        "train/contrastive_loss": contrastive_loss,
+                        "train/lr": self.optimizer.param_groups[0]["lr"],
+                    }
+                )
 
             # ----- Non-evaluation epoch: just log training loss and move on -----
             if (epoch + 1) % args.verbose != 0:
                 perf_str: str = (
-                    'Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f]' % (
-                        epoch, time() - t1, loss, mf_loss, emb_loss, contrastive_loss
-                    )
+                    f"Epoch {epoch} [{time() - t1:.1f}s]: "
+                    f"train==[{loss:.5f}={mf_loss:.5f} + {emb_loss:.5f} + {contrastive_loss:.5f}]"
                 )
                 training_time_list.append(time() - t1)
                 self.logger.logging(perf_str)
@@ -409,47 +409,45 @@ class Trainer(object):
 
             # Store validation metrics for later analysis
             loss_loger.append(loss)
-            rec_loger.append(ret['recall'])
-            pre_loger.append(ret['precision'])
-            ndcg_loger.append(ret['ndcg'])
-            hit_loger.append(ret['hit_ratio'])
+            rec_loger.append(ret["recall"])
+            pre_loger.append(ret["precision"])
+            ndcg_loger.append(ret["ndcg"])
+            hit_loger.append(ret["hit_ratio"])
 
             # Pretty-print epoch summary
             if args.verbose > 0:
                 perf_str = (
-                    'Epoch %d [%.1fs + %.1fs]: train==[%.5f=%.5f + %.5f + %.5f], '
-                    'recall=[%.5f, %.5f], precision=[%.5f, %.5f], '
-                    'hit=[%.5f, %.5f], ndcg=[%.5f, %.5f]' % (
-                        epoch, t2 - t1, t3 - t2,
-                        loss, mf_loss, emb_loss, contrastive_loss,
-                        ret['recall'][0], ret['recall'][-1],
-                        ret['precision'][0], ret['precision'][-1],
-                        ret['hit_ratio'][0], ret['hit_ratio'][-1],
-                        ret['ndcg'][0], ret['ndcg'][-1],
-                    )
+                    f"Epoch {epoch} [{t2 - t1:.1f}s + {t3 - t2:.1f}s]: "
+                    f"train==[{loss:.5f}={mf_loss:.5f} + {emb_loss:.5f} + {contrastive_loss:.5f}], "
+                    f"recall=[{ret['recall'][0]:.5f}, {ret['recall'][-1]:.5f}], "
+                    f"precision=[{ret['precision'][0]:.5f}, {ret['precision'][-1]:.5f}], "
+                    f"hit=[{ret['hit_ratio'][0]:.5f}, {ret['hit_ratio'][-1]:.5f}], "
+                    f"ndcg=[{ret['ndcg'][0]:.5f}, {ret['ndcg'][-1]:.5f}]"
                 )
                 self.logger.logging(perf_str)
 
             # ----- W&B: log validation metrics -----
             if args.use_wandb and wandb is not None:
-                wandb.log({
-                    'epoch': epoch,
-                    'val/recall@10': ret['recall'][0],
-                    'val/recall@20': ret['recall'][-1],
-                    'val/precision@10': ret['precision'][0],
-                    'val/precision@20': ret['precision'][-1],
-                    'val/ndcg@10': ret['ndcg'][0],
-                    'val/ndcg@20': ret['ndcg'][-1],
-                    'val/hit@10': ret['hit_ratio'][0],
-                    'val/hit@20': ret['hit_ratio'][-1],
-                })
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "val/recall@10": ret["recall"][0],
+                        "val/recall@20": ret["recall"][-1],
+                        "val/precision@10": ret["precision"][0],
+                        "val/precision@20": ret["precision"][-1],
+                        "val/ndcg@10": ret["ndcg"][0],
+                        "val/ndcg@20": ret["ndcg"][-1],
+                        "val/hit@10": ret["hit_ratio"][0],
+                        "val/hit@20": ret["hit_ratio"][-1],
+                    }
+                )
 
             # ----- ReduceLROnPlateau step (monitors val recall@20) -----
             if self.reduce_lr_scheduler is not None:
-                self.reduce_lr_scheduler.step(ret['recall'][-1])
+                self.reduce_lr_scheduler.step(ret["recall"][-1])
 
             # ----- Optuna: report intermediate value & check pruning -----
-            current_val_recall: float = float(ret['recall'][-1])
+            current_val_recall: float = float(ret["recall"][-1])
             if current_val_recall > best_val_recall:
                 best_val_recall = current_val_recall
 
@@ -458,49 +456,52 @@ class Trainer(object):
                 eval_step += 1
                 if self.optuna_trial.should_prune():
                     self.logger.logging(
-                        f'Optuna pruned at epoch {epoch} '
-                        f'(val recall@20 = {current_val_recall:.6f})'
+                        f"Optuna pruned at epoch {epoch} "
+                        f"(val recall@20 = {current_val_recall:.6f})"
                     )
                     if args.use_wandb and wandb is not None:
                         wandb.finish(exit_code=0)
                     import optuna as _optuna_mod
+
                     raise _optuna_mod.TrialPruned(
-                        f'Pruned at epoch {epoch}, val recall@20={current_val_recall:.6f}'
+                        f"Pruned at epoch {epoch}, val recall@20={current_val_recall:.6f}"
                     )
 
             # ===== Early-stopping logic =====
             improved: bool = False
-            if (ret['recall'][1] > best_recall + args.early_stopping_min_delta or
-                    ret['ndcg'][1] > best_ndcg + args.early_stopping_min_delta):
-                if ret['recall'][1] > best_recall:
-                    best_recall = ret['recall'][1]
-                if ret['ndcg'][1] > best_ndcg:
-                    best_ndcg = ret['ndcg'][1]
+            if (
+                ret["recall"][1] > best_recall + args.early_stopping_min_delta
+                or ret["ndcg"][1] > best_ndcg + args.early_stopping_min_delta
+            ):
+                if ret["recall"][1] > best_recall:
+                    best_recall = ret["recall"][1]
+                if ret["ndcg"][1] > best_ndcg:
+                    best_ndcg = ret["ndcg"][1]
                 improved = True
 
             if improved:
                 # ---- Improvement found → evaluate on the TEST set ----
                 test_ret = self.test(users_to_test, is_val=False)
 
+                ks_mid = eval(args.Ks)[1]
                 self.logger.logging(
-                    "Test_Recall@%d: %.8f   Test_Precision@%d: %.8f   "
-                    "Test_NDCG@%d: %.8f" % (
-                        eval(args.Ks)[1], test_ret['recall'][1],
-                        eval(args.Ks)[1], test_ret['precision'][1],
-                        eval(args.Ks)[1], test_ret['ndcg'][1],
-                    )
+                    f"Test_Recall@{ks_mid}: {test_ret['recall'][1]:.8f}   "
+                    f"Test_Precision@{ks_mid}: {test_ret['precision'][1]:.8f}   "
+                    f"Test_NDCG@{ks_mid}: {test_ret['ndcg'][1]:.8f}"
                 )
 
                 # W&B: log test metrics at this checkpoint
                 if args.use_wandb and wandb is not None:
-                    wandb.log({
-                        'epoch': epoch,
-                        'test/recall@20': test_ret['recall'][1],
-                        'test/precision@20': test_ret['precision'][1],
-                        'test/ndcg@20': test_ret['ndcg'][1],
-                        'best_recall': best_recall,
-                        'best_ndcg': best_ndcg,
-                    })
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            "test/recall@20": test_ret["recall"][1],
+                            "test/precision@20": test_ret["precision"][1],
+                            "test/ndcg@20": test_ret["ndcg"][1],
+                            "best_recall": best_recall,
+                            "best_ndcg": best_ndcg,
+                        }
+                    )
 
                 stopping_step = 0
 
@@ -511,41 +512,44 @@ class Trainer(object):
                 if stopping_step < args.early_stopping_patience:
                     stopping_step += 1
                     self.logger.logging(
-                        '#####Early stopping steps: %d #####' % stopping_step
+                        f"#####Early stopping steps: {stopping_step} #####"
                     )
                 else:
-                    self.logger.logging('#####Early stop! #####')
-                    if args.early_stopping_restore_best and best_model_state is not None:
+                    self.logger.logging("#####Early stop! #####")
+                    if (
+                        args.early_stopping_restore_best
+                        and best_model_state is not None
+                    ):
                         self.model.load_state_dict(best_model_state)
-                        self.logger.logging('Restored best model weights.')
-                    fname: str = f'Model.epoch={epoch}.pth'
+                        self.logger.logging("Restored best model weights.")
+                    fname: str = f"Model.epoch={epoch}.pth"
                     torch.save(self.model.state_dict(), os.path.join(path, fname))
                     break
             else:
                 self.logger.logging(
-                    f'Epoch {epoch}: no improvement, but '
-                    f'min_epochs={args.early_stopping_min_epochs} not reached yet'
+                    f"Epoch {epoch}: no improvement, but "
+                    f"min_epochs={args.early_stopping_min_epochs} not reached yet"
                 )
 
         # ===== Post-training: log and return the BEST test results =====
         best_test_recall: float = 0.0
         if isinstance(test_ret, dict):
             Ks_list: list[int] = eval(args.Ks)
-            best_test_recall = float(test_ret['recall'][1])
+            best_test_recall = float(test_ret["recall"][1])
             self.logger.logging(
-                "BEST_Test_Recall@%d: %.8f" % (Ks_list[1], test_ret['recall'][1])
+                f"BEST_Test_Recall@{Ks_list[1]}: {test_ret['recall'][1]:.8f}"
             )
             self.logger.logging(
-                "BEST_Test_Precision@%d: %.8f" % (Ks_list[1], test_ret['precision'][1])
+                f"BEST_Test_Precision@{Ks_list[1]}: {test_ret['precision'][1]:.8f}"
             )
             self.logger.logging(
-                "BEST_Test_NDCG@%d: %.8f" % (Ks_list[1], test_ret['ndcg'][1])
+                f"BEST_Test_NDCG@{Ks_list[1]}: {test_ret['ndcg'][1]:.8f}"
             )
 
             if args.use_wandb and wandb is not None:
-                wandb.summary['best_test_recall@20'] = test_ret['recall'][1]
-                wandb.summary['best_test_precision@20'] = test_ret['precision'][1]
-                wandb.summary['best_test_ndcg@20'] = test_ret['ndcg'][1]
+                wandb.summary["best_test_recall@20"] = test_ret["recall"][1]
+                wandb.summary["best_test_precision@20"] = test_ret["precision"][1]
+                wandb.summary["best_test_ndcg@20"] = test_ret["ndcg"][1]
 
         self.logger.logging(str(test_ret))
         self.logger.logging_sum(f"{path_name}:{str(test_ret)}")
@@ -585,9 +589,9 @@ class Trainer(object):
 
         # L2 regularisation: penalise large embedding norms
         regularizer: torch.Tensor = (
-            1. / 2 * (users ** 2).sum()
-            + 1. / 2 * (pos_items ** 2).sum()
-            + 1. / 2 * (neg_items ** 2).sum()
+            1.0 / 2 * (users**2).sum()
+            + 1.0 / 2 * (pos_items**2).sum()
+            + 1.0 / 2 * (neg_items**2).sum()
         )
         regularizer = regularizer / self.batch_size
 
@@ -602,9 +606,7 @@ class Trainer(object):
     # -----------------------------------------------------------------------
     #  Utility: scipy sparse → torch sparse
     # -----------------------------------------------------------------------
-    def sparse_mx_to_torch_sparse_tensor(
-        self, sparse_mx: sp.spmatrix
-    ) -> torch.Tensor:
+    def sparse_mx_to_torch_sparse_tensor(self, sparse_mx: sp.spmatrix) -> torch.Tensor:
         """Convert a scipy sparse matrix to a torch sparse COO tensor."""
         sparse_mx = sparse_mx.tocoo().astype(np.float32)
         indices: torch.Tensor = torch.from_numpy(
@@ -622,7 +624,7 @@ def set_seed(seed: int) -> None:
     """Set random seeds for Python, NumPy, and PyTorch (CPU + all GPUs)."""
     np.random.seed(seed)
     random.seed(seed)
-    torch.manual_seed(seed)          # CPU
+    torch.manual_seed(seed)  # CPU
     torch.cuda.manual_seed_all(seed)  # all GPUs
 
 
@@ -660,12 +662,14 @@ def train_evaluation_loop(
     if args_ns is not None:
         args = args_ns
         import utility.load_data as _ld
+
         _ld.args = args
 
     wandb = None
     if args.use_wandb:
         try:
             import wandb as _wandb
+
             wandb = _wandb
         except ImportError:
             args.use_wandb = 0
@@ -678,15 +682,15 @@ def train_evaluation_loop(
     set_seed(args.seed)
 
     config: dict[str, Any] = dict()
-    config['n_users'] = data_generator.n_users
-    config['n_items'] = data_generator.n_items
-    config['UI_mat'] = data_generator.get_UI_mat()
-    config['User_mat'] = data_generator.get_U2U_mat()
+    config["n_users"] = data_generator.n_users
+    config["n_items"] = data_generator.n_items
+    config["UI_mat"] = data_generator.get_UI_mat()
+    config["User_mat"] = data_generator.get_U2U_mat()
 
     if args.dataset == "Tiktok":
-        config['Item_mat'] = data_generator.get_tiktok_I2I_Hypergraph_mul_mat()
+        config["Item_mat"] = data_generator.get_tiktok_I2I_Hypergraph_mul_mat()
     elif args.dataset in ["Clothing", "Sports", "Baby"]:
-        config['Item_mat'] = data_generator.get_I2I_Hypergraph_mul_mat()
+        config["Item_mat"] = data_generator.get_I2I_Hypergraph_mul_mat()
 
     trainer: Trainer = Trainer(data_config=config, optuna_trial=optuna_trial)
     best_recall: float = trainer.train(return_validation=return_validation)
@@ -701,5 +705,5 @@ def train_evaluation_loop(
 # ===========================================================================
 #  Entry point (CLI)
 # ===========================================================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_evaluation_loop()

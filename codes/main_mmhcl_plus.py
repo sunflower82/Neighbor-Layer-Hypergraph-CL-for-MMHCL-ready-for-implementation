@@ -44,41 +44,43 @@ import pathlib
 import random
 import sys
 from time import time
-from typing import Any, Optional, Union
+from typing import Any
+
+from Models import MMHCL
 
 # ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
 import numpy.typing as npt
-import scipy.sparse as sp
 import torch
-import torch.nn as nn
+from torch.amp import GradScaler, autocast
 import torch.nn.functional as F
 import torch.optim as optim
+from utility.batch_test import *  # also instantiates global data_generator
+from utility.logging import Logger
 
 # ── repo utilities (identical to main.py) ─────────────────────────────────────
 from utility.parser import parse_args
-from Models import MMHCL
-from utility.batch_test import *          # also instantiates global data_generator
-from utility.logging import Logger
 
 # ── MMHCL+ scaffold ───────────────────────────────────────────────────────────
 _SCAFFOLD = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'mmhcl_plus_scaffold')
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "mmhcl_plus_scaffold"
+    )
 )
 if _SCAFFOLD not in sys.path:
     sys.path.insert(0, _SCAFFOLD)
 
+from mmhcl_plus.contrast.gradnorm import GradNormLossBalancer
 from mmhcl_plus.contrast.losses import barlow_twins_loss, chunked_info_nce_loss
-from mmhcl_plus.contrast.soft_byol import soft_byol_alignment
 from mmhcl_plus.contrast.neighbor_pairs import build_neighbor_layer_pairs
+from mmhcl_plus.contrast.soft_byol import soft_byol_alignment
+from mmhcl_plus.model.projector import ExpandedProjector
 from mmhcl_plus.topology.dynamic_ema_weights import (
     WEMAManager,
-    update_ema_teacher,
     build_item_wema,
     build_user_wema,
+    update_ema_teacher,
 )
-from mmhcl_plus.model.projector import ExpandedProjector
-from mmhcl_plus.contrast.gradnorm import GradNormLossBalancer
 
 # ── parse args ────────────────────────────────────────────────────────────────
 args = parse_args()
@@ -147,10 +149,14 @@ class MMHCLWithLayers(MMHCL):
         U2U_mat: torch.Tensor,
         checkpoint_threshold: int = -1,
     ) -> tuple[
-        torch.Tensor, torch.Tensor,
-        torch.Tensor, torch.Tensor,
-        list[torch.Tensor], list[torch.Tensor],
-        torch.Tensor, torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[torch.Tensor],
+        list[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """
         Extended forward pass that returns layer caches alongside final embeddings.
@@ -177,7 +183,7 @@ class MMHCLWithLayers(MMHCL):
         use_ckpt = checkpoint_threshold >= 0 and torch.is_grad_enabled()
 
         # ── Item hypergraph with layer caching + checkpointing ────────────
-        ii_emb: torch.Tensor = self.ii_embedding.weight      # layer 0
+        ii_emb: torch.Tensor = self.ii_embedding.weight  # layer 0
         ii_layers: list[torch.Tensor] = [ii_emb]
         for layer_id in range(self._n_item_layers):
             if use_ckpt and layer_id >= checkpoint_threshold:
@@ -190,7 +196,7 @@ class MMHCLWithLayers(MMHCL):
         ii_final = ii_emb
 
         # ── User hypergraph with layer caching + checkpointing ────────────
-        uu_emb: torch.Tensor = self.uu_embedding.weight      # layer 0
+        uu_emb: torch.Tensor = self.uu_embedding.weight  # layer 0
         uu_layers: list[torch.Tensor] = [uu_emb]
         for layer_id in range(self._n_user_layers):
             if use_ckpt and layer_id >= checkpoint_threshold:
@@ -203,7 +209,7 @@ class MMHCLWithLayers(MMHCL):
         uu_final = uu_emb
 
         # ── CF branch (LightGCN bipartite) ────────────────────────────────
-        if args.cf_model == 'LightGCN':
+        if args.cf_model == "LightGCN":
             ego: torch.Tensor = torch.cat(
                 (self.user_ui_embedding.weight, self.item_ui_embedding.weight), dim=0
             )
@@ -214,7 +220,7 @@ class MMHCLWithLayers(MMHCL):
             mean_e = torch.stack(all_e, dim=1).mean(dim=1)
             u_bip, i_bip = torch.split(mean_e, [self.n_users, self.n_items], dim=0)
 
-        elif args.cf_model == 'MF':
+        elif args.cf_model == "MF":
             u_bip = self.user_ui_embedding.weight
             i_bip = self.item_ui_embedding.weight
 
@@ -253,7 +259,7 @@ def sparse_dirichlet_energy(emb: torch.Tensor, adj: torch.Tensor) -> torch.Tenso
     Both emb and adj must be on the same device.
     """
     n = emb.size(0)
-    adj_emb = torch.sparse.mm(adj, emb)   # (A @ E)
+    adj_emb = torch.sparse.mm(adj, emb)  # (A @ E)
     return ((emb * emb).sum() - (emb * adj_emb).sum()) / n
 
 
@@ -275,15 +281,18 @@ class MMHCLPlusTrainer:
         optuna_trial: Any = None,
     ) -> None:
         self.optuna_trial = optuna_trial
-        self.n_users: int = data_config['n_users']
-        self.n_items: int = data_config['n_items']
+        self.n_users: int = data_config["n_users"]
+        self.n_items: int = data_config["n_items"]
 
         # Logger (same path convention as Trainer)
         self.logger: Logger = Logger(
-            path, is_debug=args.debug, target=path_name,
-            path2=record_path, ablation_target=args.ablation_target,
+            path,
+            is_debug=args.debug,
+            target=path_name,
+            path2=record_path,
+            ablation_target=args.ablation_target,
         )
-        self.logger.logging("PID: %d" % os.getpid())
+        self.logger.logging(f"PID: {os.getpid()}")
         self.logger.logging(str(args))
 
         self.lr: float = args.lr
@@ -293,13 +302,15 @@ class MMHCLPlusTrainer:
         self.decay: float = self.regs
 
         # Adjacency matrices (moved to GPU)
-        self.UI_mat: torch.Tensor = data_config['UI_mat'].cuda()
-        self.User_mat: torch.Tensor = data_config['User_mat'].cuda()
-        self.Item_mat: torch.Tensor = data_config['Item_mat'].cuda()
+        self.UI_mat: torch.Tensor = data_config["UI_mat"].cuda()
+        self.User_mat: torch.Tensor = data_config["User_mat"].cuda()
+        self.Item_mat: torch.Tensor = data_config["Item_mat"].cuda()
 
         # Extended MMHCL model (student / online network)
         self.model: MMHCLWithLayers = MMHCLWithLayers(
-            self.n_users, self.n_items, self.emb_dim,
+            self.n_users,
+            self.n_items,
+            self.emb_dim,
             n_item_layers=args.Item_layers,
             n_user_layers=args.User_layers,
         ).cuda()
@@ -317,6 +328,34 @@ class MMHCLPlusTrainer:
             hidden_dim=args.projector_hidden_dim,
             out_dim=args.projector_out_dim,
         ).cuda()
+
+        if getattr(args, "compile_projector", 0) == 1:
+            compile_fn = getattr(torch, "compile", None)
+            if compile_fn is not None:
+                try:
+                    self.projector = compile_fn(self.projector, mode="reduce-overhead")
+                    self.logger.logging(
+                        "[MMHCL+] torch.compile(ExpandedProjector) enabled."
+                    )
+                except Exception as exc:
+                    self.logger.logging(
+                        f"[MMHCL+] torch.compile(projector) skipped: {exc}"
+                    )
+
+        amp_mode = getattr(args, "amp_mode", "off")
+        self._amp_enabled: bool = (
+            amp_mode in ("bf16", "fp16") and torch.cuda.is_available()
+        )
+        self._amp_dtype: torch.dtype = (
+            torch.bfloat16 if amp_mode == "bf16" else torch.float16
+        )
+        self._use_grad_scaler: bool = amp_mode == "fp16" and torch.cuda.is_available()
+        self._scaler = GradScaler("cuda", enabled=self._use_grad_scaler)
+        self._grad_clip: float = float(getattr(args, "grad_clip_norm", 1.0))
+        if self._amp_enabled:
+            self.logger.logging(
+                f"[MMHCL+] AMP: mode={amp_mode}  GradScaler={self._use_grad_scaler}  grad_clip={self._grad_clip:.4f}"
+            )
 
         # GradNorm balancer (5 tasks: bpr, u2u, i2i, align, dirichlet)
         self.balancer: GradNormLossBalancer = GradNormLossBalancer(
@@ -340,23 +379,27 @@ class MMHCLPlusTrainer:
         )
 
         # LR schedulers (identical to Trainer)
-        fac = lambda epoch: 0.96 ** (epoch / 50)
+        def fac(epoch):
+            return 0.96 ** (epoch / 50)
+
         self.lr_scheduler: optim.lr_scheduler.LambdaLR = optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=fac
         )
-        self.reduce_lr_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = (
+        self.reduce_lr_scheduler: optim.lr_scheduler.ReduceLROnPlateau | None = (
             optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode=args.early_stopping_mode,
                 factor=args.reduce_lr_factor,
                 patience=args.reduce_lr_patience,
                 min_lr=args.reduce_lr_min,
-            ) if args.use_reduce_lr else None
+            )
+            if args.use_reduce_lr
+            else None
         )
 
         # WEMAManager — item and user side (TEX §4.2 + §3.4)
-        self.w_ema_i: Optional[WEMAManager] = None
-        self.w_ema_u: Optional[WEMAManager] = None
+        self.w_ema_i: WEMAManager | None = None
+        self.w_ema_u: WEMAManager | None = None
         self._init_wema_managers(data_config)
 
     # -----------------------------------------------------------------------
@@ -374,11 +417,11 @@ class MMHCLPlusTrainer:
         """
         data_path = os.path.join(args.data_path, args.dataset)
         feat_paths = [
-            os.path.join(data_path, 'image_feat.npy'),
-            os.path.join(data_path, 'text_feat.npy'),
+            os.path.join(data_path, "image_feat.npy"),
+            os.path.join(data_path, "text_feat.npy"),
         ]
-        n_items = data_config['n_items']
-        n_users = data_config['n_users']
+        n_items = data_config["n_items"]
+        n_users = data_config["n_users"]
 
         # ── Item-side WEMAManager ─────────────────────────────────────────
         self.w_ema_i = build_item_wema(
@@ -389,11 +432,13 @@ class MMHCLPlusTrainer:
             percentile=args.soft_purification_percentile,
             purification_temp=args.soft_purification_temp,
             logger=self.logger,
+            ann_backend=args.wema_ann_backend,
+            ann_k=args.wema_ann_k,
         )
         if self.w_ema_i is None:
             self.logger.logging(
-                "[MMHCL+] No item feature files found in %s; "
-                "item-side WEMAManager disabled (i2i ASW skipped)." % data_path
+                f"[MMHCL+] No item feature files found in {data_path}; "
+                "item-side WEMAManager disabled (i2i ASW skipped)."
             )
 
         # ── User-side WEMAManager ─────────────────────────────────────────
@@ -407,11 +452,13 @@ class MMHCLPlusTrainer:
             percentile=args.soft_purification_percentile,
             purification_temp=args.soft_purification_temp,
             logger=self.logger,
+            ann_backend=args.wema_ann_backend,
+            ann_k=args.wema_ann_k,
         )
         if self.w_ema_u is None:
             self.logger.logging(
-                "[MMHCL+] No item feature files found in %s; "
-                "user-side WEMAManager disabled (u2u ASW skipped)." % data_path
+                f"[MMHCL+] No item feature files found in {data_path}; "
+                "user-side WEMAManager disabled (u2u ASW skipped)."
             )
 
     # -----------------------------------------------------------------------
@@ -435,7 +482,7 @@ class MMHCLPlusTrainer:
         """BPR loss with L2 embedding regularisation (identical to Trainer.bpr_loss)."""
         pos_scores = (u * pos_i).sum(dim=1)
         neg_scores = (u * neg_i).sum(dim=1)
-        reg = (u ** 2).sum() + (pos_i ** 2).sum() + (neg_i ** 2).sum()
+        reg = (u**2).sum() + (pos_i**2).sum() + (neg_i**2).sum()
         reg = reg / (2.0 * self.batch_size)
         mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
         emb_loss = self.decay * reg
@@ -456,34 +503,34 @@ class MMHCLPlusTrainer:
         """
         training_time_list: list[float] = []
         loss_loger: list[float] = []
-        rec_loger:  list[npt.NDArray] = []
-        pre_loger:  list[npt.NDArray] = []
+        rec_loger: list[npt.NDArray] = []
+        pre_loger: list[npt.NDArray] = []
         ndcg_loger: list[npt.NDArray] = []
-        hit_loger:  list[npt.NDArray] = []
+        hit_loger: list[npt.NDArray] = []
 
         stopping_step: int = 0
         best_recall: float = 0.0
         best_ndcg: float = 0.0
         best_val_recall: float = 0.0
-        best_model_state: Optional[dict] = None
-        test_ret: Union[str, MetricsDict] = ""
+        best_model_state: dict | None = None
+        test_ret: str | MetricsDict = ""
         eval_step: int = 0
 
         # W&B initialisation (identical to Trainer.train)
         if args.use_wandb and wandb is not None:
             wconfig = vars(args)
-            wconfig['path_name'] = path_name
+            wconfig["path_name"] = path_name
             winit: dict[str, Any] = {
-                'project': args.wandb_project,
-                'config': wconfig,
-                'reinit': True,
+                "project": args.wandb_project,
+                "config": wconfig,
+                "reinit": True,
             }
             if args.wandb_entity:
-                winit['entity'] = args.wandb_entity
+                winit["entity"] = args.wandb_entity
             if args.wandb_run_name:
-                winit['name'] = args.wandb_run_name
+                winit["name"] = args.wandb_run_name
             wandb.init(**winit)
-            self.logger.logging("W&B run initialized: %s" % wandb.run.name)
+            self.logger.logging(f"W&B run initialized: {wandb.run.name}")
 
         # ── Epoch loop ──────────────────────────────────────────────────────
         for epoch in range(args.epoch):
@@ -492,17 +539,17 @@ class MMHCLPlusTrainer:
             # Temperature annealing (TEX §4.3)
             tau: float = max(
                 args.tau_min,
-                args.tau_max * (args.tau_gamma ** epoch),
+                args.tau_max * (args.tau_gamma**epoch),
             )
             in_warmup: bool = epoch < args.warmup_epochs
 
             # Epoch-level loss accumulators
             loss_acc = 0.0
-            bpr_acc  = 0.0
-            u2u_acc  = 0.0
-            i2i_acc  = 0.0
-            aln_acc  = 0.0
-            dir_acc  = 0.0
+            bpr_acc = 0.0
+            u2u_acc = 0.0
+            i2i_acc = 0.0
+            aln_acc = 0.0
+            dir_acc = 0.0
             n_batch: int = data_generator.n_train // args.batch_size + 1
 
             # ── Mini-batch loop ──────────────────────────────────────────────
@@ -514,122 +561,128 @@ class MMHCLPlusTrainer:
                 # BPR sampling
                 users, pos_items, neg_items = data_generator.sample()
 
-                # Forward pass — student (online) network with checkpointing
-                (u_final, i_final,
-                 ii_final, uu_final,
-                 ii_layers, uu_layers,
-                 u_bip, i_bip) = self.model.forward_plus(
-                    self.UI_mat, self.Item_mat, self.User_mat,
-                    checkpoint_threshold=args.checkpoint_threshold,
-                )
+                amp_dev = "cuda" if torch.cuda.is_available() else "cpu"
 
-                # BPR loss
-                u_g   = u_final[users]
-                pos_g = i_final[pos_items]
-                neg_g = i_final[neg_items]
-                batch_mf, batch_emb, _ = self.bpr_loss(u_g, pos_g, neg_g)
-                bpr_term = batch_mf + batch_emb
+                # Forward, BPR, CL, BYOL under autocast; Dirichlet + GradNorm combine outside
+                # (MMHCL_Plus_Optimization_Report — AMP + stable Dirichlet trace).
+                with autocast(
+                    device_type=amp_dev,
+                    dtype=self._amp_dtype,
+                    enabled=self._amp_enabled,
+                ):
+                    (
+                        u_final,
+                        i_final,
+                        ii_final,
+                        uu_final,
+                        ii_layers,
+                        uu_layers,
+                        u_bip,
+                        i_bip,
+                    ) = self.model.forward_plus(
+                        self.UI_mat,
+                        self.Item_mat,
+                        self.User_mat,
+                        checkpoint_threshold=args.checkpoint_threshold,
+                    )
 
-                device = u_final.device
+                    u_g = u_final[users]
+                    pos_g = i_final[pos_items]
+                    neg_g = i_final[neg_items]
+                    batch_mf, batch_emb, _ = self.bpr_loss(u_g, pos_g, neg_g)
+                    bpr_term = batch_mf + batch_emb
 
-                if in_warmup:
-                    # Warmup: only BPR
-                    batch_loss = bpr_term
-                    batch_u2u  = torch.zeros(1, device=device)
-                    batch_i2i  = torch.zeros(1, device=device)
-                    batch_aln  = torch.zeros(1, device=device)
-                    batch_dir  = torch.zeros(1, device=device)
+                    device = u_final.device
 
-                else:
-                    # ── u2u: Barlow Twins on adjacent user-hypergraph layers ──
-                    # User-side ASW: soft topology weights from w_ema_u (TEX §4.4 Listing 2)
-                    user_t = torch.tensor(users, dtype=torch.long)
-                    soft_w_u: Optional[torch.Tensor] = None
-                    if self.w_ema_u is not None:
-                        u_rows = self.w_ema_u.get_batch_weights(user_t.cpu(), device=device)
-                        # Mean over neighbor dimension → per-user importance scalar [B]
-                        soft_w_u = u_rows.mean(dim=-1)
-                        if soft_w_u.size(0) != len(users):
-                            soft_w_u = None  # safety guard
-
-                    u_pairs = build_neighbor_layer_pairs(uu_layers)
-                    u2u_terms: list[torch.Tensor] = []
-                    for h_l, h_lp1 in u_pairs:
-                        z1 = self.projector(h_l[users])
-                        z2 = self.projector(h_lp1[users])
-                        u2u_terms.append(
-                            barlow_twins_loss(
-                                z1, z2,
-                                lambd=args.barlow_lambda,
-                                soft_weights=soft_w_u,
+                    if in_warmup:
+                        batch_u2u = torch.zeros(1, device=device)
+                        batch_i2i = torch.zeros(1, device=device)
+                        batch_aln = torch.zeros(1, device=device)
+                        batch_dir = torch.zeros(1, device=device)
+                        batch_loss = bpr_term
+                    else:
+                        user_t = torch.tensor(users, dtype=torch.long)
+                        soft_w_u: torch.Tensor | None = None
+                        if self.w_ema_u is not None:
+                            u_rows = self.w_ema_u.get_batch_weights(
+                                user_t.cpu(), device=device
                             )
-                        )
-                    batch_u2u = (
-                        torch.stack(u2u_terms).mean()
-                        if u2u_terms
-                        else torch.zeros(1, device=device)
-                    )
+                            soft_w_u = u_rows.mean(dim=-1)
+                            if soft_w_u.size(0) != len(users):
+                                soft_w_u = None
 
-                    # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
-                    i_pairs = build_neighbor_layer_pairs(ii_layers)
-                    i2i_terms: list[torch.Tensor] = []
-                    item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
-
-                    for h_l, h_lp1 in i_pairs:
-                        q = h_l[pos_items]
-                        k = h_lp1[pos_items]
-
-                        # Adaptive sample weighting from W_ema (item-side only)
-                        dyn_w: Optional[torch.Tensor] = None
-                        if self.w_ema_i is not None:
-                            w_rows = self.w_ema_i.get_batch_weights(
-                                item_t.cpu(), device=device
-                            )                             # [B, n_items]
-                            col_idx = item_t.cpu().long()
-                            if col_idx.max() < w_rows.size(1):
-                                dyn_w = w_rows[:, col_idx].to(device)  # [B, B]
-                                if dyn_w.size(0) != q.size(0):
-                                    dyn_w = None               # safety guard
-
-                        i2i_terms.append(
-                            chunked_info_nce_loss(
-                                q, k,
-                                tau=tau,
-                                chunk_size=args.info_nce_chunk_size,
-                                dynamic_weights=dyn_w,
+                        u_pairs = build_neighbor_layer_pairs(uu_layers)
+                        u2u_terms: list[torch.Tensor] = []
+                        for h_l, h_lp1 in u_pairs:
+                            z1 = self.projector(h_l[users])
+                            z2 = self.projector(h_lp1[users])
+                            u2u_terms.append(
+                                barlow_twins_loss(
+                                    z1,
+                                    z2,
+                                    lambd=args.barlow_lambda,
+                                    soft_weights=soft_w_u,
+                                )
                             )
+                        batch_u2u = (
+                            torch.stack(u2u_terms).mean()
+                            if u2u_terms
+                            else torch.zeros(1, device=device)
                         )
-                    batch_i2i = (
-                        torch.stack(i2i_terms).mean()
-                        if i2i_terms
-                        else torch.zeros(1, device=device)
-                    )
 
-                    # ── Soft BYOL cross-view alignment via EMA teacher ────────
-                    # Teacher produces stable stop-gradient targets (TEX §4.4 Alg.1 Step 6)
-                    # sg(f_ξ(B^(L))) — the EMA model runs without grad
-                    with torch.no_grad():
-                        (_, _,
-                         ii_final_t, uu_final_t,
-                         _, _,
-                         u_bip_t, i_bip_t) = self.ema_model.forward_plus(
-                            self.UI_mat, self.Item_mat, self.User_mat,
-                            checkpoint_threshold=-1,  # no checkpointing in teacher
+                        i_pairs = build_neighbor_layer_pairs(ii_layers)
+                        i2i_terms: list[torch.Tensor] = []
+                        item_t = torch.tensor(
+                            pos_items, dtype=torch.long, device=device
                         )
-                    batch_aln = (
-                        soft_byol_alignment(ii_final, i_bip_t)
-                        + soft_byol_alignment(uu_final, u_bip_t)
-                    )
 
-                    # ── Dirichlet energy regularisation ───────────────────────
-                    batch_dir = (
-                        sparse_dirichlet_energy(ii_final, self.Item_mat)
-                        + sparse_dirichlet_energy(uu_final, self.User_mat)
-                    )
+                        for h_l, h_lp1 in i_pairs:
+                            q = h_l[pos_items]
+                            k = h_lp1[pos_items]
 
-                    # ── Real GradNorm balanced combination ───────────────────
-                    # Shared backbone parameters: embedding tables that all tasks
-                    # depend on (used to compute per-task gradient norms)
+                            dyn_w: torch.Tensor | None = None
+                            if self.w_ema_i is not None:
+                                w_rows = self.w_ema_i.get_batch_weights(
+                                    item_t.cpu(), device=device
+                                )
+                                col_idx = item_t.cpu().long()
+                                if col_idx.max() < w_rows.size(1):
+                                    dyn_w = w_rows[:, col_idx].to(device)
+                                    if dyn_w.size(0) != q.size(0):
+                                        dyn_w = None
+
+                            i2i_terms.append(
+                                chunked_info_nce_loss(
+                                    q,
+                                    k,
+                                    tau=tau,
+                                    chunk_size=args.info_nce_chunk_size,
+                                    dynamic_weights=dyn_w,
+                                )
+                            )
+                        batch_i2i = (
+                            torch.stack(i2i_terms).mean()
+                            if i2i_terms
+                            else torch.zeros(1, device=device)
+                        )
+
+                        with torch.no_grad():
+                            (_, _, ii_final_t, uu_final_t, _, _, u_bip_t, i_bip_t) = (
+                                self.ema_model.forward_plus(
+                                    self.UI_mat,
+                                    self.Item_mat,
+                                    self.User_mat,
+                                    checkpoint_threshold=-1,
+                                )
+                            )
+                        batch_aln = soft_byol_alignment(
+                            ii_final, i_bip_t
+                        ) + soft_byol_alignment(uu_final, u_bip_t)
+
+                if not in_warmup:
+                    batch_dir = sparse_dirichlet_energy(
+                        ii_final, self.Item_mat
+                    ) + sparse_dirichlet_energy(uu_final, self.User_mat)
                     shared_params = [
                         self.model.ii_embedding.weight,
                         self.model.uu_embedding.weight,
@@ -641,9 +694,23 @@ class MMHCLPlusTrainer:
                         shared_params=shared_params,
                     )
 
-                # Back-propagation
-                batch_loss.backward(retain_graph=False)
-                self.optimizer.step()
+                opt_params = (
+                    list(self.model.parameters())
+                    + list(self.projector.parameters())
+                    + list(self.balancer.parameters())
+                )
+                if self._use_grad_scaler:
+                    self._scaler.scale(batch_loss).backward(retain_graph=False)
+                    if self._grad_clip > 0:
+                        self._scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(opt_params, self._grad_clip)
+                    self._scaler.step(self.optimizer)
+                    self._scaler.update()
+                else:
+                    batch_loss.backward(retain_graph=False)
+                    if self._grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(opt_params, self._grad_clip)
+                    self.optimizer.step()
 
                 # ── EMA teacher update (Algorithm 1, Step 11: ξ ← β·ξ + (1-β)·θ) ──
                 update_ema_teacher(self.model, self.ema_model, args.ema_momentum)
@@ -654,22 +721,26 @@ class MMHCLPlusTrainer:
                     if self.w_ema_i is not None:
                         with torch.no_grad():
                             self.w_ema_i.step_update(
-                                ii_final[pos_items].detach().cpu(), pos_t, epoch,
+                                ii_final[pos_items].detach().cpu(),
+                                pos_t,
+                                epoch,
                             )
                     if self.w_ema_u is not None:
                         user_t_cpu = torch.tensor(users, dtype=torch.long)
                         with torch.no_grad():
                             self.w_ema_u.step_update(
-                                uu_final[users].detach().cpu(), user_t_cpu, epoch,
+                                uu_final[users].detach().cpu(),
+                                user_t_cpu,
+                                epoch,
                             )
 
                 # Accumulate scalars
                 loss_acc += batch_loss.item()
-                bpr_acc  += bpr_term.item()
-                u2u_acc  += batch_u2u.item()
-                i2i_acc  += batch_i2i.item()
-                aln_acc  += batch_aln.item()
-                dir_acc  += batch_dir.item()
+                bpr_acc += bpr_term.item()
+                u2u_acc += batch_u2u.item()
+                i2i_acc += batch_i2i.item()
+                aln_acc += batch_aln.item()
+                dir_acc += batch_dir.item()
 
             # ── End mini-batch loop ──────────────────────────────────────────
             self.lr_scheduler.step()
@@ -685,42 +756,38 @@ class MMHCLPlusTrainer:
 
             # NaN guard
             if math.isnan(loss_acc):
-                self.logger.logging('ERROR: loss is nan.')
+                self.logger.logging("ERROR: loss is nan.")
                 if args.use_wandb and wandb is not None:
                     wandb.finish(exit_code=1)
                 return 0.0
 
             # W&B training metrics
             if args.use_wandb and wandb is not None:
-                wandb.log({
-                    'epoch': epoch,
-                    'train/loss': loss_acc,
-                    'train/bpr':  bpr_acc,
-                    'train/u2u':  u2u_acc,
-                    'train/i2i':  i2i_acc,
-                    'train/align': aln_acc,
-                    'train/dirichlet': dir_acc,
-                    'train/tau':  tau,
-                    'train/warmup': int(in_warmup),
-                    'train/lr':   self.optimizer.param_groups[0]['lr'],
-                })
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "train/loss": loss_acc,
+                        "train/bpr": bpr_acc,
+                        "train/u2u": u2u_acc,
+                        "train/i2i": i2i_acc,
+                        "train/align": aln_acc,
+                        "train/dirichlet": dir_acc,
+                        "train/tau": tau,
+                        "train/warmup": int(in_warmup),
+                        "train/lr": self.optimizer.param_groups[0]["lr"],
+                    }
+                )
 
             # Build performance string (same pattern as main.py for log compatibility)
-            phase_tag = '[WARMUP]' if in_warmup else '[tau=%.4f]' % tau
+            phase_tag = "[WARMUP]" if in_warmup else f"[tau={tau:.4f}]"
 
             if (epoch + 1) % args.verbose != 0:
                 # Non-evaluation epoch: only log training loss
                 perf_str = (
-                    'Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s'
-                    % (
-                        epoch, time() - t1, loss_acc,
-                        bpr_acc  / n_batch,
-                        u2u_acc  / n_batch,
-                        i2i_acc  / n_batch,
-                        aln_acc  / n_batch,
-                        dir_acc  / n_batch,
-                        phase_tag,
-                    )
+                    f"Epoch {epoch} [{time() - t1:.1f}s]: "
+                    f"train==[{loss_acc:.5f}={bpr_acc / n_batch:.5f} + {u2u_acc / n_batch:.5f} + "
+                    f"{i2i_acc / n_batch:.5f} + {aln_acc / n_batch:.5f} + {dir_acc / n_batch:.5f}] "
+                    f"{phase_tag}"
                 )
                 training_time_list.append(time() - t1)
                 self.logger.logging(perf_str)
@@ -729,58 +796,51 @@ class MMHCLPlusTrainer:
             # ── Evaluation epoch (every verbose epochs) ──────────────────────
             t2 = time()
             users_to_test = list(data_generator.test_set.keys())
-            users_to_val  = list(data_generator.val_set.keys())
+            users_to_val = list(data_generator.val_set.keys())
             ret: MetricsDict = self.test(users_to_val, is_val=True)
             training_time_list.append(t2 - t1)
             t3 = time()
 
             loss_loger.append(loss_acc)
-            rec_loger.append(ret['recall'])
-            pre_loger.append(ret['precision'])
-            ndcg_loger.append(ret['ndcg'])
-            hit_loger.append(ret['hit_ratio'])
+            rec_loger.append(ret["recall"])
+            pre_loger.append(ret["precision"])
+            ndcg_loger.append(ret["ndcg"])
+            hit_loger.append(ret["hit_ratio"])
 
             if args.verbose > 0:
                 perf_str = (
-                    'Epoch %d [%.1fs + %.1fs]: '
-                    'train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s, '
-                    'recall=[%.5f, %.5f], precision=[%.5f, %.5f], '
-                    'hit=[%.5f, %.5f], ndcg=[%.5f, %.5f]'
-                    % (
-                        epoch, t2 - t1, t3 - t2, loss_acc,
-                        bpr_acc  / n_batch,
-                        u2u_acc  / n_batch,
-                        i2i_acc  / n_batch,
-                        aln_acc  / n_batch,
-                        dir_acc  / n_batch,
-                        phase_tag,
-                        ret['recall'][0],    ret['recall'][-1],
-                        ret['precision'][0], ret['precision'][-1],
-                        ret['hit_ratio'][0], ret['hit_ratio'][-1],
-                        ret['ndcg'][0],      ret['ndcg'][-1],
-                    )
+                    f"Epoch {epoch} [{t2 - t1:.1f}s + {t3 - t2:.1f}s]: "
+                    f"train==[{loss_acc:.5f}={bpr_acc / n_batch:.5f} + {u2u_acc / n_batch:.5f} + "
+                    f"{i2i_acc / n_batch:.5f} + {aln_acc / n_batch:.5f} + {dir_acc / n_batch:.5f}] "
+                    f"{phase_tag}, "
+                    f"recall=[{ret['recall'][0]:.5f}, {ret['recall'][-1]:.5f}], "
+                    f"precision=[{ret['precision'][0]:.5f}, {ret['precision'][-1]:.5f}], "
+                    f"hit=[{ret['hit_ratio'][0]:.5f}, {ret['hit_ratio'][-1]:.5f}], "
+                    f"ndcg=[{ret['ndcg'][0]:.5f}, {ret['ndcg'][-1]:.5f}]"
                 )
                 self.logger.logging(perf_str)
 
             # W&B validation metrics
             if args.use_wandb and wandb is not None:
-                wandb.log({
-                    'epoch': epoch,
-                    'val/recall@10':    ret['recall'][0],
-                    'val/recall@20':    ret['recall'][-1],
-                    'val/precision@10': ret['precision'][0],
-                    'val/precision@20': ret['precision'][-1],
-                    'val/ndcg@10':      ret['ndcg'][0],
-                    'val/ndcg@20':      ret['ndcg'][-1],
-                    'val/hit@10':       ret['hit_ratio'][0],
-                    'val/hit@20':       ret['hit_ratio'][-1],
-                })
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "val/recall@10": ret["recall"][0],
+                        "val/recall@20": ret["recall"][-1],
+                        "val/precision@10": ret["precision"][0],
+                        "val/precision@20": ret["precision"][-1],
+                        "val/ndcg@10": ret["ndcg"][0],
+                        "val/ndcg@20": ret["ndcg"][-1],
+                        "val/hit@10": ret["hit_ratio"][0],
+                        "val/hit@20": ret["hit_ratio"][-1],
+                    }
+                )
 
             # ReduceLROnPlateau step
             if self.reduce_lr_scheduler is not None:
-                self.reduce_lr_scheduler.step(ret['recall'][-1])
+                self.reduce_lr_scheduler.step(ret["recall"][-1])
 
-            current_val_recall = float(ret['recall'][-1])
+            current_val_recall = float(ret["recall"][-1])
             if current_val_recall > best_val_recall:
                 best_val_recall = current_val_recall
 
@@ -789,39 +849,42 @@ class MMHCLPlusTrainer:
                 self.optuna_trial.report(current_val_recall, eval_step)
                 eval_step += 1
                 if self.optuna_trial.should_prune():
-                    self.logger.logging('Optuna pruned at epoch %d' % epoch)
+                    self.logger.logging(f"Optuna pruned at epoch {epoch}")
                     if args.use_wandb and wandb is not None:
                         wandb.finish(exit_code=0)
                     import optuna as _optuna_mod
+
                     raise _optuna_mod.TrialPruned()
 
             # ── Early stopping ───────────────────────────────────────────────
             improved = False
-            if (ret['recall'][1]  > best_recall + args.early_stopping_min_delta or
-                    ret['ndcg'][1] > best_ndcg + args.early_stopping_min_delta):
-                if ret['recall'][1] > best_recall:
-                    best_recall = ret['recall'][1]
-                if ret['ndcg'][1] > best_ndcg:
-                    best_ndcg = ret['ndcg'][1]
+            if (
+                ret["recall"][1] > best_recall + args.early_stopping_min_delta
+                or ret["ndcg"][1] > best_ndcg + args.early_stopping_min_delta
+            ):
+                if ret["recall"][1] > best_recall:
+                    best_recall = ret["recall"][1]
+                if ret["ndcg"][1] > best_ndcg:
+                    best_ndcg = ret["ndcg"][1]
                 improved = True
 
             if improved:
                 test_ret = self.test(users_to_test, is_val=False)
+                ks_mid = eval(args.Ks)[1]
                 self.logger.logging(
-                    "Test_Recall@%d: %.8f   Test_Precision@%d: %.8f   "
-                    "Test_NDCG@%d: %.8f" % (
-                        eval(args.Ks)[1], test_ret['recall'][1],
-                        eval(args.Ks)[1], test_ret['precision'][1],
-                        eval(args.Ks)[1], test_ret['ndcg'][1],
-                    )
+                    f"Test_Recall@{ks_mid}: {test_ret['recall'][1]:.8f}   "
+                    f"Test_Precision@{ks_mid}: {test_ret['precision'][1]:.8f}   "
+                    f"Test_NDCG@{ks_mid}: {test_ret['ndcg'][1]:.8f}"
                 )
                 if args.use_wandb and wandb is not None:
-                    wandb.log({
-                        'epoch': epoch,
-                        'test/recall@20':    test_ret['recall'][1],
-                        'test/precision@20': test_ret['precision'][1],
-                        'test/ndcg@20':      test_ret['ndcg'][1],
-                    })
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            "test/recall@20": test_ret["recall"][1],
+                            "test/precision@20": test_ret["precision"][1],
+                            "test/ndcg@20": test_ret["ndcg"][1],
+                        }
+                    )
                 stopping_step = 0
                 if args.early_stopping_restore_best:
                     best_model_state = copy.deepcopy(self.model.state_dict())
@@ -830,45 +893,47 @@ class MMHCLPlusTrainer:
                 if stopping_step < args.early_stopping_patience:
                     stopping_step += 1
                     self.logger.logging(
-                        '#####Early stopping steps: %d #####' % stopping_step
+                        f"#####Early stopping steps: {stopping_step} #####"
                     )
                 else:
-                    self.logger.logging('#####Early stop! #####')
-                    if args.early_stopping_restore_best and best_model_state is not None:
+                    self.logger.logging("#####Early stop! #####")
+                    if (
+                        args.early_stopping_restore_best
+                        and best_model_state is not None
+                    ):
                         self.model.load_state_dict(best_model_state)
-                        self.logger.logging('Restored best model weights.')
-                    fname = 'Model.epoch=%d.pth' % epoch
+                        self.logger.logging("Restored best model weights.")
+                    fname = f"Model.epoch={epoch}.pth"
                     torch.save(self.model.state_dict(), os.path.join(path, fname))
                     break
             else:
                 self.logger.logging(
-                    'Epoch %d: no improvement, but '
-                    'min_epochs=%d not reached yet'
-                    % (epoch, args.early_stopping_min_epochs)
+                    f"Epoch {epoch}: no improvement, but "
+                    f"min_epochs={args.early_stopping_min_epochs} not reached yet"
                 )
 
         # ── Post-training: log best test results ─────────────────────────────
         best_test_recall = 0.0
         if isinstance(test_ret, dict):
             Ks_list: list[int] = eval(args.Ks)
-            best_test_recall = float(test_ret['recall'][1])
+            best_test_recall = float(test_ret["recall"][1])
             # These log lines are parsed by the notebook's results cell
             self.logger.logging(
-                "BEST_Test_Recall@%d: %.8f" % (Ks_list[1], test_ret['recall'][1])
+                f"BEST_Test_Recall@{Ks_list[1]}: {test_ret['recall'][1]:.8f}"
             )
             self.logger.logging(
-                "BEST_Test_Precision@%d: %.8f" % (Ks_list[1], test_ret['precision'][1])
+                f"BEST_Test_Precision@{Ks_list[1]}: {test_ret['precision'][1]:.8f}"
             )
             self.logger.logging(
-                "BEST_Test_NDCG@%d: %.8f" % (Ks_list[1], test_ret['ndcg'][1])
+                f"BEST_Test_NDCG@{Ks_list[1]}: {test_ret['ndcg'][1]:.8f}"
             )
             if args.use_wandb and wandb is not None:
-                wandb.summary['best_test_recall@20']    = test_ret['recall'][1]
-                wandb.summary['best_test_precision@20'] = test_ret['precision'][1]
-                wandb.summary['best_test_ndcg@20']      = test_ret['ndcg'][1]
+                wandb.summary["best_test_recall@20"] = test_ret["recall"][1]
+                wandb.summary["best_test_precision@20"] = test_ret["precision"][1]
+                wandb.summary["best_test_ndcg@20"] = test_ret["ndcg"][1]
 
         self.logger.logging(str(test_ret))
-        self.logger.logging_sum("%s:%s" % (path_name, str(test_ret)))
+        self.logger.logging_sum(f"{path_name}:{str(test_ret)}")
 
         if args.use_wandb and wandb is not None:
             wandb.finish()
@@ -907,12 +972,14 @@ def train_evaluation_loop(
     if args_ns is not None:
         args = args_ns
         import utility.load_data as _ld
+
         _ld.args = args
 
     wandb = None
     if args.use_wandb:
         try:
             import wandb as _wandb
+
             wandb = _wandb
         except ImportError:
             args.use_wandb = 0
@@ -925,15 +992,15 @@ def train_evaluation_loop(
     set_seed(args.seed)
 
     config: dict[str, Any] = {
-        'n_users': data_generator.n_users,
-        'n_items': data_generator.n_items,
-        'UI_mat':  data_generator.get_UI_mat(),
-        'User_mat': data_generator.get_U2U_mat(),
+        "n_users": data_generator.n_users,
+        "n_items": data_generator.n_items,
+        "UI_mat": data_generator.get_UI_mat(),
+        "User_mat": data_generator.get_U2U_mat(),
     }
     if args.dataset == "Tiktok":
-        config['Item_mat'] = data_generator.get_tiktok_I2I_Hypergraph_mul_mat()
+        config["Item_mat"] = data_generator.get_tiktok_I2I_Hypergraph_mul_mat()
     elif args.dataset in ["Clothing", "Sports", "Baby"]:
-        config['Item_mat'] = data_generator.get_I2I_Hypergraph_mul_mat()
+        config["Item_mat"] = data_generator.get_I2I_Hypergraph_mul_mat()
 
     trainer = MMHCLPlusTrainer(data_config=config, optuna_trial=optuna_trial)
     best_recall: float = trainer.train(return_validation=return_validation)
@@ -948,5 +1015,5 @@ def train_evaluation_loop(
 # ===========================================================================
 #  CLI entry point
 # ===========================================================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     train_evaluation_loop()

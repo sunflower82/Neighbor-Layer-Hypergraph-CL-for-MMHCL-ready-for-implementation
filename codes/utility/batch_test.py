@@ -30,17 +30,17 @@ Two ranking strategies:
 
 from __future__ import annotations
 
-from typing import Any
-
-import utility.metrics as metrics
-from utility.parser import parse_args
-from utility.load_data import Data
-import multiprocessing
 import argparse
 import heapq
-import torch
+import multiprocessing
+from typing import Any
+
 import numpy as np
 import numpy.typing as npt
+import torch
+from utility.load_data import Data
+import utility.metrics as metrics
+from utility.parser import parse_args
 
 # ---------------------------------------------------------------------------
 #  Module-level initialisation (runs at import time)
@@ -106,13 +106,11 @@ def ranklist_by_heapq(
             r.append(1)
         else:
             r.append(0)
-    auc: float = 0.
+    auc: float = 0.0
     return r, auc
 
 
-def get_auc(
-    item_score: dict[int, float], user_pos_test: list[int]
-) -> float:
+def get_auc(item_score: dict[int, float], user_pos_test: list[int]) -> float:
     """
     Compute AUC (Area Under ROC Curve) for a single user.
 
@@ -191,11 +189,11 @@ def get_performance(
         hit_ratio.append(metrics.hit_at_k(r, K))
 
     return {
-        'recall': np.array(recall),
-        'precision': np.array(precision),
-        'ndcg': np.array(ndcg),
-        'hit_ratio': np.array(hit_ratio),
-        'auc': auc,
+        "recall": np.array(recall),
+        "precision": np.array(precision),
+        "ndcg": np.array(ndcg),
+        "hit_ratio": np.array(hit_ratio),
+        "auc": auc,
     }
 
 
@@ -215,8 +213,8 @@ def test_one_user(x: tuple[npt.NDArray[np.floating], int, bool]) -> MetricsDict:
         dict of metrics for this user (same format as get_performance).
     """
     is_val: bool = x[-1]
-    rating: npt.NDArray[np.floating] = x[0]   # predicted scores for ALL items
-    u: int = x[1]                              # user ID
+    rating: npt.NDArray[np.floating] = x[0]  # predicted scores for ALL items
+    u: int = x[1]  # user ID
 
     # Items this user interacted with during training (must be excluded)
     training_items: list[int]
@@ -239,7 +237,7 @@ def test_one_user(x: tuple[npt.NDArray[np.floating], int, bool]) -> MetricsDict:
     # Rank and compute metrics
     r: list[int]
     auc: float
-    if args.test_flag == 'part':
+    if args.test_flag == "part":
         r, auc = ranklist_by_heapq(user_pos_test, test_items, rating, Ks)
     else:
         r, auc = ranklist_by_sorted(user_pos_test, test_items, rating, Ks)
@@ -276,11 +274,11 @@ def test_torch(
     """
     # Initialise accumulators for averaging
     result: MetricsDict = {
-        'precision': np.zeros(len(Ks)),
-        'recall': np.zeros(len(Ks)),
-        'ndcg': np.zeros(len(Ks)),
-        'hit_ratio': np.zeros(len(Ks)),
-        'auc': 0.,
+        "precision": np.zeros(len(Ks)),
+        "recall": np.zeros(len(Ks)),
+        "ndcg": np.zeros(len(Ks)),
+        "hit_ratio": np.zeros(len(Ks)),
+        "auc": 0.0,
     }
     pool: multiprocessing.pool.Pool = multiprocessing.Pool(cores)
 
@@ -296,7 +294,7 @@ def test_torch(
     for u_batch_id in range(n_user_batchs):
         start: int = u_batch_id * u_batch_size
         end: int = (u_batch_id + 1) * u_batch_size
-        user_batch: list[int] = test_users[start: end]
+        user_batch: list[int] = test_users[start:end]
 
         rate_batch: npt.NDArray[np.floating] | torch.Tensor
 
@@ -318,7 +316,7 @@ def test_torch(
                     u_g_embeddings, torch.transpose(i_g_embeddings, 0, 1)
                 )
 
-                rate_batch[:, i_start: i_end] = i_rate_batch
+                rate_batch[:, i_start:i_end] = i_rate_batch
                 i_count += i_rate_batch.shape[1]
 
             assert i_count == ITEM_NUM
@@ -337,9 +335,7 @@ def test_torch(
         rate_batch = rate_batch.detach().cpu().numpy()
 
         # Zip scores with user IDs and val/test flag for multiprocessing
-        user_batch_rating_uid = zip(
-            rate_batch, user_batch, [is_val] * len(user_batch)
-        )
+        user_batch_rating_uid = zip(rate_batch, user_batch, [is_val] * len(user_batch))
 
         # Parallel per-user metric computation
         batch_result: list[MetricsDict] = pool.map(test_one_user, user_batch_rating_uid)
@@ -347,11 +343,11 @@ def test_torch(
 
         # Accumulate (running average: each user contributes 1/n_test_users)
         for re in batch_result:
-            result['precision'] += re['precision'] / n_test_users
-            result['recall'] += re['recall'] / n_test_users
-            result['ndcg'] += re['ndcg'] / n_test_users
-            result['hit_ratio'] += re['hit_ratio'] / n_test_users
-            result['auc'] += re['auc'] / n_test_users
+            result["precision"] += re["precision"] / n_test_users
+            result["recall"] += re["recall"] / n_test_users
+            result["ndcg"] += re["ndcg"] / n_test_users
+            result["hit_ratio"] += re["hit_ratio"] / n_test_users
+            result["auc"] += re["auc"] / n_test_users
 
     assert count == n_test_users
     pool.close()
