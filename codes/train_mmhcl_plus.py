@@ -222,7 +222,7 @@ def main() -> None:
     else:
 
         def infonce_fn(a, b, tau=None, dynamic_weights=None):
-            t = tau if tau is not None else cfg.loss.tau
+            t = tau if tau is not None else cfg.loss.tau_max
             return chunked_info_nce_loss(
                 a,
                 b,

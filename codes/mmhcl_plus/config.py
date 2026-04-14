@@ -24,13 +24,13 @@ class ModelConfig:
 
 @dataclass
 class LossConfig:
-    # Temperature — used as τ_max; anneals toward τ_min (TEX §4.3)
-    tau: float = 0.2
+    # Temperature annealing schedule (TEX §4.3):
+    #   tau(t) = max(tau_min, tau_max * tau_gamma^t)
     tau_max: float = 0.5  # initial (warm) temperature
     tau_min: float = 0.05  # floor temperature after annealing
     tau_gamma: float = 0.99  # exponential decay factor per epoch
     # Warmup: skip CL losses for the first N epochs (TEX §4.4 code snippet)
-    warmup_epochs: int = 5
+    warmup_epochs: int = 10
     # Barlow Twins off-diagonal penalty coefficient
     barlow_lambda: float = 5e-3
     # Chunked InfoNCE chunk size

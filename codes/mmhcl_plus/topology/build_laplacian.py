@@ -22,6 +22,7 @@ import scipy.sparse as sp
 def build_hypergraph_laplacian(
     interaction_matrix: sp.spmatrix,
     w_e: np.ndarray | None = None,
+    use_structural_weight: bool = True,
 ) -> sp.csr_matrix:
     """
     Build the hypergraph Laplacian  L = I − Θ  in CSR format.
@@ -32,8 +33,12 @@ def build_hypergraph_laplacian(
         Incidence matrix  H  of shape (n_nodes, n_edges).  For a user–item
         bipartite hypergraph this is typically the binary interaction matrix.
     w_e : np.ndarray or None
-        Edge-weight vector of length n_edges.  Defaults to uniform weights
-        (all ones).
+        Edge-weight vector of length n_edges.  If provided, used directly.
+        If None, behaviour depends on ``use_structural_weight``.
+    use_structural_weight : bool
+        When ``w_e`` is None and this flag is True (default), automatically
+        compute  W_e(e,e) = 1 / (1 + |e|)  as specified by TEX Eq. (1).
+        Set to False for uniform (all-ones) weights.
 
     Returns
     -------
@@ -53,7 +58,11 @@ def build_hypergraph_laplacian(
     d_e_inv = np.where(d_e > 0, 1.0 / d_e, 0.0)
 
     if w_e is None:
-        w_e = np.ones(n_edges, dtype=np.float64)
+        if use_structural_weight:
+            # TEX Eq. (1): W_e(e,e) = 1 / (1 + |e|)
+            w_e = 1.0 / (1.0 + d_e)
+        else:
+            w_e = np.ones(n_edges, dtype=np.float64)
 
     D_v_inv_sqrt = sp.diags(d_v_inv_sqrt)
     D_e_inv = sp.diags(d_e_inv)
