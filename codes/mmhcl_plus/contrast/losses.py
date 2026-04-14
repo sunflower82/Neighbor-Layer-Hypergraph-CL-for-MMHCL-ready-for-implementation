@@ -28,43 +28,15 @@ For the i2i / InfoNCE branch:
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn.functional as F
+
+from mmhcl_plus.config import BARLOW_PROJ_DIM
+
 
 # ---------------------------------------------------------------------------
 # Utility
 # ---------------------------------------------------------------------------
-
-
-def _align_chunk_size_tensor_cores(chunk_size: int, n: int) -> int:
-    """Snap chunk size to a multiple of 64 for Tensor Core throughput (report §low-prio)."""
-    if n <= 0:
-        return 1
-    chunk_size = max(1, min(chunk_size, n))
-    aligned = (chunk_size // 64) * 64
-    if aligned >= 64:
-        return aligned
-    return min(64, n)
-
-
-def _maybe_torch_compile(fn):
-    """
-    JIT-compile dense loss kernels (MMHCL+ Optimization Report — Opt. 1).
-
-    Set environment variable MMHCL_DISABLE_TORCH_COMPILE=1 to force eager mode.
-    """
-    if os.environ.get("MMHCL_DISABLE_TORCH_COMPILE", "").strip():
-        return fn
-    compile_fn = getattr(torch, "compile", None)
-    if compile_fn is None:
-        return fn
-    try:
-        return compile_fn(fn, dynamic=True, fullgraph=False)
-    except Exception:
-        return fn
-
 
 def off_diagonal(x: torch.Tensor) -> torch.Tensor:
     """Return all off-diagonal elements of a square matrix as a 1-D tensor."""
@@ -77,12 +49,12 @@ def off_diagonal(x: torch.Tensor) -> torch.Tensor:
 # Barlow Twins (u2u branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
 
-
-def _barlow_twins_loss_impl(
+def barlow_twins_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
     lambd: float = 5e-3,
     soft_weights: torch.Tensor | None = None,
+    normalize_by_dim: bool = True,
 ) -> torch.Tensor:
     """
     Barlow Twins loss with optional per-sample soft weighting (TEX §4.4).
@@ -92,15 +64,22 @@ def _barlow_twins_loss_impl(
     semantically similar pairs (high W_ema[i, i+]) and down-weights noisy ones,
     implementing Adaptive Sample Weighting (ASW) from NLGCL+ §3.3.
 
-    The expanded projector (d=64 → D=8192) applied upstream ensures that the
-    cross-correlation matrix is well-conditioned despite the small embedding dim.
+    The expanded projector (d=64 → D=BARLOW_PROJ_DIM=8192) applied upstream
+    ensures the cross-correlation matrix is well-conditioned.
 
     Args:
-        z1, z2:       [B, D] projected embeddings (after ExpandedProjector).
-        lambd:        Off-diagonal penalty coefficient.
-        soft_weights: Optional [B] float tensor of per-sample importance weights.
-                      Values are L1-normalised internally so the total scale of
-                      the loss is preserved regardless of how weights are produced.
+        z1, z2:          [B, D] projected embeddings (after ExpandedProjector).
+        lambd:           Off-diagonal penalty coefficient λ (default 5e-3).
+        soft_weights:    Optional [B] float tensor of per-sample importance
+                         weights.  L1-normalised internally to preserve total
+                         loss scale regardless of weight distribution.
+        normalize_by_dim: If True (default), divide the final loss by
+                         BARLOW_PROJ_DIM (= D = 8192).  This removes the O(D)
+                         scale inflation caused by summing D² cross-correlation
+                         entries, bringing u2u into the same order of magnitude
+                         as BPR (~0.08–0.35 vs ~0.13) so GradNorm converges
+                         without fighting a ~5000× scale gap.
+                         Set to False only for ablation / backward-compat tests.
 
     Returns:
         Scalar loss.
@@ -122,18 +101,19 @@ def _barlow_twins_loss_impl(
 
     on_diag = torch.diagonal(c).add(-1).pow(2).sum()
     off_diag_term = off_diagonal(c).pow(2).sum()
-    return on_diag + lambd * off_diag_term
+    loss = on_diag + lambd * off_diag_term
 
+    if normalize_by_dim:
+        loss = loss / BARLOW_PROJ_DIM
 
-barlow_twins_loss = _maybe_torch_compile(_barlow_twins_loss_impl)
+    return loss
 
 
 # ---------------------------------------------------------------------------
 # Chunked InfoNCE (i2i branch — Stage 1 intra-branch CL)
 # ---------------------------------------------------------------------------
 
-
-def _chunked_info_nce_loss_impl(
+def chunked_info_nce_loss(
     q: torch.Tensor,
     k: torch.Tensor,
     tau: float = 0.2,
@@ -168,14 +148,13 @@ def _chunked_info_nce_loss_impl(
     q = F.normalize(q, p=2, dim=-1)
     k = F.normalize(k, p=2, dim=-1)
     n = q.size(0)
-    chunk_size = _align_chunk_size_tensor_cores(chunk_size, n)
     labels = torch.arange(n, device=q.device)
     losses: list[torch.Tensor] = []
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        chunk_q = q[start:end]  # [C, d]
-        logits = chunk_q @ k.T / tau  # [C, N]
+        chunk_q = q[start:end]                       # [C, d]
+        logits = chunk_q @ k.T / tau                 # [C, N]
 
         if dynamic_weights is not None:
             # Log-prior correction (adaptive sample weighting)
@@ -187,18 +166,12 @@ def _chunked_info_nce_loss_impl(
     return torch.stack(losses).mean()
 
 
-chunked_info_nce_loss = _maybe_torch_compile(_chunked_info_nce_loss_impl)
-
-
 def temperature_free_info_nce_loss(
     q: torch.Tensor,
     k: torch.Tensor,
 ) -> torch.Tensor:
     """InfoNCE with τ = 1.0 (temperature-free baseline)."""
-    n = q.size(0)
-    cs = max(256, min(2048, n))
-    cs = _align_chunk_size_tensor_cores(cs, n)
-    return chunked_info_nce_loss(q, k, tau=1.0, chunk_size=cs)
+    return chunked_info_nce_loss(q, k, tau=1.0, chunk_size=max(256, min(2048, q.size(0))))
 
 
 def info_nce_loss(
@@ -217,7 +190,6 @@ def info_nce_loss(
 # ---------------------------------------------------------------------------
 # BPR loss (main recommendation task)
 # ---------------------------------------------------------------------------
-
 
 def bpr_loss(
     pos_scores: torch.Tensor,

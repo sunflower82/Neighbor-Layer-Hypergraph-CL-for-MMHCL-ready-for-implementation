@@ -1,1 +1,0 @@
-from .dirichlet import dirichlet_energy_batch, dirichlet_energy_minibatch
