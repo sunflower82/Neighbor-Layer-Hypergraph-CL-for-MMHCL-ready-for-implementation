@@ -6,11 +6,12 @@ The original preprocess script used http:// which is now blocked.
 This script converts to https:// and re-downloads all images.
 """
 
-import gzip, json, os, numpy as np, torch, requests
+import json, os, numpy as np, torch, requests
 from io import BytesIO
 from PIL import Image
 from tqdm import tqdm
 from transformers import CLIPProcessor, CLIPModel
+from preprocess_helpers import iter_gzip_jsonlines, select_image_url, clip_image_embeddings
 
 BASE     = os.path.join(os.path.dirname(__file__), "data", "Baby")
 META_GZ  = os.path.join(BASE, "meta_Baby.json.gz")
@@ -36,36 +37,13 @@ print("CLIP model loaded.")
 print("Reading metadata and fixing image URLs...")
 item_urls: dict[int, str] = {}
 
-with gzip.open(META_GZ, "rb") as f:
-    for line in f:
-        try:
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                d = eval(line)
-
-            asin = d.get("asin", "")
-            if asin not in item2id:
-                continue
-
-            iid = item2id[asin]
-
-            # Prefer high-resolution; fall back to imUrl
-            url = ""
-            if d.get("imageURLHighRes"):
-                url = d["imageURLHighRes"][0] if d["imageURLHighRes"] else ""
-            if not url:
-                url = d.get("imUrl", "") or ""
-
-            # Fix: replace http:// with https:// for Amazon CDN
-            if url.startswith("http://"):
-                url = "https://" + url[7:]
-
-            if url:
-                item_urls[iid] = url
-
-        except Exception:
-            continue
+for d in iter_gzip_jsonlines(META_GZ):
+    asin = d.get("asin", "")
+    if asin not in item2id:
+        continue
+    url = select_image_url(d, force_https=True)
+    if url:
+        item_urls[item2id[asin]] = url
 
 print(f"URLs collected: {len(item_urls):,} / {NUM_ITEMS:,}")
 
@@ -89,15 +67,7 @@ with torch.no_grad():
             img  = Image.open(BytesIO(resp.content)).convert("RGB")
             inp  = processor(images=img, return_tensors="pt").to(DEVICE)
 
-            raw = model.get_image_features(**inp)
-            # transformers v5: returns BaseModelOutputWithPooling where
-            # pooler_output is already the 512-d projected embedding
-            if isinstance(raw, torch.Tensor):
-                emb = raw
-            elif hasattr(raw, "pooler_output"):
-                emb = raw.pooler_output   # already projected to 512-d
-            else:
-                emb = raw[1]
+            emb = clip_image_embeddings(model, inp)
             image_features[iid] = emb.cpu().numpy().flatten()
             ok += 1
         except Exception:

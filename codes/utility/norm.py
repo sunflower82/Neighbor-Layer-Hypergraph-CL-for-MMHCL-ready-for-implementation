@@ -5,10 +5,7 @@ norm.py — Graph Normalisation Utilities
 Provides functions for building similarity graphs and normalising
 adjacency matrices (both sparse and dense formats).
 
-These are used by Models.py (imported at the top) but NOT directly called
-during training — load_data.py has its own inline versions.  This module
-exists for the LATTICE-style model variants that use ``build_knn_normalized_graph``
-with sparse output and Laplacian normalisation.
+Used by Models.py and load_data.py (which delegates ``build_sim`` here).
 
 Normalisation types:
     'sym'  : Symmetric normalisation    D^{-½} A D^{-½}
@@ -32,19 +29,20 @@ def build_sim(context: torch.Tensor) -> torch.Tensor:
     """
     Compute a pairwise cosine similarity matrix.
 
+    Items with zero-norm feature vectors (e.g. broken image URLs) produce
+    NaN after division; these are replaced with 0, giving those items zero
+    similarity with everything.
+
     Args:
         context : (N, D) tensor — feature vectors for N entities
 
     Returns:
         (N, N) tensor — cosine similarity matrix, values in [-1, 1].
-
-    Steps:
-        1. L2-normalise each row:  context_norm = F / ||F||_2
-        2. Compute dot products:   sim = context_norm · context_norm^T
     """
     context_norm: torch.Tensor = context.div(
         torch.norm(context, p=2, dim=-1, keepdim=True)
     )
+    context_norm[context_norm.isnan()] = 0
     sim: torch.Tensor = torch.mm(context_norm, context_norm.transpose(1, 0))
     return sim
 

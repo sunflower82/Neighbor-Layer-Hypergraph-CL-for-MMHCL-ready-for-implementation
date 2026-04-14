@@ -51,6 +51,13 @@ import torch.sparse as sparse
 import scipy.sparse as sp
 
 from utility.parser import parse_args
+from utility.common import (
+    set_seed,
+    build_experiment_paths as _build_paths,
+    lr_decay_schedule,
+    bpr_loss as _bpr_loss,
+    sparse_mx_to_torch_sparse_tensor as _sparse_mx_to_torch,
+)
 
 from Models import MMHCL
 
@@ -87,20 +94,6 @@ if args.use_wandb:
 path_name: str = ""
 path: str = ""
 record_path: str = ""
-
-
-def _build_paths(a: argparse.Namespace) -> tuple[str, str, str]:
-    """Compute experiment directory paths from hyperparameters."""
-    pn: str = (
-        f"uu_ii={a.User_layers}_{a.Item_layers}"
-        f"_{a.user_loss_ratio}_{a.item_loss_ratio}"
-        f"_topk={a.topk}_t={a.temperature}"
-        f"_regs={a.regs}_dim={a.embed_size}"
-        f"_seed={a.seed}_{a.ablation_target}"
-    )
-    p: str = f"../{a.dataset}/{pn}/"
-    rp: str = f"../{a.dataset}/MM/"
-    return pn, p, rp
 
 
 # ===========================================================================
@@ -179,9 +172,8 @@ class Trainer(object):
         This provides a smooth, gradual decay — after 50 epochs the LR is
         multiplied by 0.96, after 100 epochs by 0.96^2 ≈ 0.922, etc.
         """
-        fac = lambda epoch: 0.96 ** (epoch / 50)
         scheduler: optim.lr_scheduler.LambdaLR = optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=fac
+            self.optimizer, lr_lambda=lr_decay_schedule
         )
         return scheduler
 
@@ -566,38 +558,8 @@ class Trainer(object):
         pos_items: torch.Tensor,
         neg_items: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """
-        Compute the BPR pairwise ranking loss.
-
-        Loss = -mean( log σ(score_pos - score_neg) )  +  λ * L2_regulariser
-
-        Args:
-            users     : (batch, emb_dim) — user embeddings for this batch
-            pos_items : (batch, emb_dim) — positive item embeddings
-            neg_items : (batch, emb_dim) — negative item embeddings
-
-        Returns:
-            Tuple of (mf_loss, emb_loss, reg_loss).
-        """
-        # Predicted scores via dot product: score(u, i) = u^T · i
-        pos_scores: torch.Tensor = torch.sum(torch.mul(users, pos_items), dim=1)
-        neg_scores: torch.Tensor = torch.sum(torch.mul(users, neg_items), dim=1)
-
-        # L2 regularisation: penalise large embedding norms
-        regularizer: torch.Tensor = (
-            1. / 2 * (users ** 2).sum()
-            + 1. / 2 * (pos_items ** 2).sum()
-            + 1. / 2 * (neg_items ** 2).sum()
-        )
-        regularizer = regularizer / self.batch_size
-
-        # BPR loss: -log( sigmoid(pos_score - neg_score) )
-        maxi: torch.Tensor = F.logsigmoid(pos_scores - neg_scores)
-        mf_loss: torch.Tensor = -torch.mean(maxi)
-
-        emb_loss: torch.Tensor = self.decay * regularizer
-        reg_loss: float = 0.0
-        return mf_loss, emb_loss, reg_loss
+        """BPR pairwise ranking loss with L2 embedding regularisation."""
+        return _bpr_loss(users, pos_items, neg_items, self.batch_size, self.decay)
 
     # -----------------------------------------------------------------------
     #  Utility: scipy sparse → torch sparse
@@ -606,24 +568,7 @@ class Trainer(object):
         self, sparse_mx: sp.spmatrix
     ) -> torch.Tensor:
         """Convert a scipy sparse matrix to a torch sparse COO tensor."""
-        sparse_mx = sparse_mx.tocoo().astype(np.float32)
-        indices: torch.Tensor = torch.from_numpy(
-            np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
-        )
-        values: torch.Tensor = torch.from_numpy(sparse_mx.data)
-        shape: torch.Size = torch.Size(sparse_mx.shape)
-        return torch.sparse_coo_tensor(indices, values, shape)
-
-
-# ===========================================================================
-#  Reproducibility: fix all random seeds
-# ===========================================================================
-def set_seed(seed: int) -> None:
-    """Set random seeds for Python, NumPy, and PyTorch (CPU + all GPUs)."""
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)          # CPU
-    torch.cuda.manual_seed_all(seed)  # all GPUs
+        return _sparse_mx_to_torch(sparse_mx)
 
 
 # ===========================================================================

@@ -57,6 +57,12 @@ import torch.optim as optim
 
 # ── repo utilities (identical to main.py) ─────────────────────────────────────
 from utility.parser import parse_args
+from utility.common import (
+    set_seed,
+    build_experiment_paths as _build_paths,
+    lr_decay_schedule,
+    bpr_loss as _bpr_loss,
+)
 from Models import MMHCL
 from utility.batch_test import *          # also instantiates global data_generator
 from utility.logging import Logger
@@ -73,6 +79,10 @@ from mmhcl_plus.topology.dynamic_ema_weights import (
 )
 from mmhcl_plus.model.projector import ExpandedProjector
 from mmhcl_plus.contrast.gradnorm import GradNormLossBalancer
+from mmhcl_plus.regularizers.dirichlet import (
+    sparse_dirichlet_energy,
+    sparse_dirichlet_energy_batch as _sparse_dirichlet_energy_batch,
+)
 
 # ── parse args ────────────────────────────────────────────────────────────────
 args = parse_args()
@@ -83,22 +93,6 @@ path_name: str = ""
 path: str = ""
 record_path: str = ""
 wandb: Any = None
-
-
-# ===========================================================================
-#  Path builder (identical to main.py for notebook compatibility)
-# ===========================================================================
-def _build_paths(a) -> tuple[str, str, str]:
-    pn = (
-        f"uu_ii={a.User_layers}_{a.Item_layers}"
-        f"_{a.user_loss_ratio}_{a.item_loss_ratio}"
-        f"_topk={a.topk}_t={a.temperature}"
-        f"_regs={a.regs}_dim={a.embed_size}"
-        f"_seed={a.seed}_{a.ablation_target}"
-    )
-    p = f"../{a.dataset}/{pn}/"
-    rp = f"../{a.dataset}/MM/"
-    return pn, p, rp
 
 
 # ---------------------------------------------------------------------------
@@ -237,52 +231,6 @@ class MMHCLWithLayers(MMHCL):
 
 
 # ===========================================================================
-#  Dirichlet energy — no dense Laplacian construction (TEX §4.2)
-# ===========================================================================
-def sparse_dirichlet_energy(emb: torch.Tensor, adj: torch.Tensor) -> torch.Tensor:
-    """
-    Compute tr(E^T L E) / n  where  L = I − A_normalised
-        = ( ||E||_F^2 − tr(E^T A E) ) / n
-
-    Both emb and adj must be on the same device.
-    """
-    n = emb.size(0)
-    adj_emb = torch.sparse.mm(adj, emb)   # (A @ E)
-    return ((emb * emb).sum() - (emb * adj_emb).sum()) / n
-
-
-def _sparse_dirichlet_energy_batch(
-    emb: torch.Tensor,
-    adj: torch.Tensor,
-    batch_idx: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Mini-batch Dirichlet energy (TEX §3.3, Corollary 1):
-
-        tr( E_B^T (I − Θ) E_B ) / B
-
-    where E_B = emb[batch_idx].  The trace is approximated by subsampling
-    only the rows corresponding to `batch_idx` from the result of (Θ @ E),
-    reducing the per-batch cost to O(B · d) for the trace evaluation while
-    the sparse propagation remains O(nnz · d).  This matches the design
-    intent: ``yielding a cost of O(B · d̄_v) per batch`` (TEX §3.3).
-
-    Args:
-        emb:       [N, d] full embedding matrix (on GPU).
-        adj:       [N, N] sparse normalised propagation operator Θ (on GPU).
-        batch_idx: [B] LongTensor of node indices for the current mini-batch
-                   (must be on the same device as emb).
-
-    Returns:
-        Scalar Dirichlet energy for the mini-batch.
-    """
-    E_batch = emb[batch_idx]                                     # [B, d]
-    adj_emb_batch = torch.sparse.mm(adj, emb)[batch_idx]        # [B, d]
-    n_batch = batch_idx.size(0)
-    return ((E_batch * E_batch).sum() - (E_batch * adj_emb_batch).sum()) / n_batch
-
-
-# ===========================================================================
 #  MMHCLPlusTrainer
 # ===========================================================================
 class MMHCLPlusTrainer:
@@ -365,9 +313,8 @@ class MMHCLPlusTrainer:
         )
 
         # LR schedulers (identical to Trainer)
-        fac = lambda epoch: 0.96 ** (epoch / 50)
         self.lr_scheduler: optim.lr_scheduler.LambdaLR = optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=fac
+            self.optimizer, lr_lambda=lr_decay_schedule
         )
         self.reduce_lr_scheduler: Optional[optim.lr_scheduler.ReduceLROnPlateau] = (
             optim.lr_scheduler.ReduceLROnPlateau(
@@ -457,14 +404,8 @@ class MMHCLPlusTrainer:
         pos_i: torch.Tensor,
         neg_i: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        """BPR loss with L2 embedding regularisation (identical to Trainer.bpr_loss)."""
-        pos_scores = (u * pos_i).sum(dim=1)
-        neg_scores = (u * neg_i).sum(dim=1)
-        reg = (u ** 2).sum() + (pos_i ** 2).sum() + (neg_i ** 2).sum()
-        reg = reg / (2.0 * self.batch_size)
-        mf_loss = -torch.mean(F.logsigmoid(pos_scores - neg_scores))
-        emb_loss = self.decay * reg
-        return mf_loss, emb_loss, 0.0
+        """BPR loss with L2 embedding regularisation."""
+        return _bpr_loss(u, pos_i, neg_i, self.batch_size, self.decay)
 
     # -----------------------------------------------------------------------
     def train(self, return_validation: bool = False) -> float:
@@ -930,16 +871,6 @@ class MMHCLPlusTrainer:
             wandb.finish()
 
         return best_val_recall if return_validation else best_test_recall
-
-
-# ===========================================================================
-#  Reproducibility helper
-# ===========================================================================
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 # ===========================================================================

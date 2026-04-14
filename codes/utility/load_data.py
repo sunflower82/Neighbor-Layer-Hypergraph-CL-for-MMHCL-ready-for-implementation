@@ -41,6 +41,8 @@ import scipy.sparse as sp
 from time import time
 import json
 from utility.parser import parse_args
+from utility.common import sparse_mx_to_torch_sparse_tensor as _sparse_mx_to_torch
+from utility.norm import build_sim as _build_sim
 import argparse
 
 args: argparse.Namespace = parse_args()
@@ -192,13 +194,7 @@ class Data(object):
         self, sparse_mx: sp.spmatrix
     ) -> torch.Tensor:
         """Convert a scipy sparse matrix to a torch sparse COO tensor."""
-        sparse_mx = sparse_mx.tocoo().astype(np.float32)
-        indices: torch.Tensor = torch.from_numpy(
-            np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64)
-        )
-        values: torch.Tensor = torch.from_numpy(sparse_mx.data)
-        shape: torch.Size = torch.Size(sparse_mx.shape)
-        return torch.sparse_coo_tensor(indices, values, shape)
+        return _sparse_mx_to_torch(sparse_mx)
 
     def print_statistics(self) -> None:
         """Print basic dataset statistics to the console."""
@@ -762,25 +758,8 @@ class Data(object):
     #  Similarity & k-NN Graph Building Utilities
     # ===================================================================
     def build_sim(self, context: torch.Tensor) -> torch.Tensor:
-        """
-        Compute a cosine similarity matrix from a feature matrix.
-
-        Items with zero-norm feature vectors (e.g. broken image URLs) are
-        handled gracefully: the resulting NaN values after division are
-        replaced with 0, giving those items zero similarity with everything.
-
-        Args:
-            context : (N, D) tensor — feature vectors for N entities
-
-        Returns:
-            (N, N) tensor — pairwise cosine similarities, values in [-1, 1].
-        """
-        context_norm: torch.Tensor = context.div(
-            torch.norm(context, p=2, dim=-1, keepdim=True)
-        )
-        context_norm[context_norm.isnan()] = 0
-        sim: torch.Tensor = torch.mm(context_norm, context_norm.transpose(1, 0))
-        return sim
+        """Cosine similarity matrix (delegates to utility.norm.build_sim)."""
+        return _build_sim(context)
 
     def build_knn_normalized_graph(
         self, adj: torch.Tensor, topk: int

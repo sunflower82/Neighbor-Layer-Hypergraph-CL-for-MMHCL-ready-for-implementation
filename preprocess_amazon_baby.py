@@ -21,7 +21,6 @@ Run from the project root:
   python preprocess_amazon_baby.py
 """
 
-import gzip
 import json
 import os
 import math
@@ -34,6 +33,12 @@ from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import CLIPProcessor, CLIPModel
+from preprocess_helpers import (
+    iter_gzip_jsonlines,
+    select_image_url,
+    clip_text_embeddings,
+    clip_image_embeddings,
+)
 
 # ===========================================================================
 #  Paths
@@ -57,16 +62,11 @@ print("PART 1: Reading reviews and building ID mappings")
 print("="*60)
 
 interactions = []
-with gzip.open(REVIEW_GZ, "rb") as f:
-    for line in f:
-        try:
-            d = json.loads(line)
-            interactions.append((
-                d["reviewerID"],
-                d["asin"],
-            ))
-        except Exception:
-            continue
+for d in iter_gzip_jsonlines(REVIEW_GZ):
+    try:
+        interactions.append((d["reviewerID"], d["asin"]))
+    except KeyError:
+        continue
 
 print(f"Total interactions read : {len(interactions):,}")
 
@@ -150,39 +150,22 @@ print("="*60)
 item_meta: dict[int, dict] = {}
 meta_found = 0
 
-with gzip.open(META_GZ, "rb") as f:
-    for line in f:
-        try:
-            # Amazon metadata files may use Python-eval format, not strict JSON
-            try:
-                d = json.loads(line)
-            except json.JSONDecodeError:
-                d = eval(line)
+for d in iter_gzip_jsonlines(META_GZ):
+    asin = d.get("asin", "")
+    if asin not in item2id:
+        continue
 
-            asin = d.get("asin", "")
-            if asin not in item2id:
-                continue
+    iid   = item2id[asin]
+    title = d.get("title", "") or ""
+    desc  = d.get("description", "") or ""
+    if isinstance(desc, list):
+        desc = " ".join(str(x) for x in desc)
 
-            iid   = item2id[asin]
-            title = d.get("title", "") or ""
-            desc  = d.get("description", "") or ""
-            if isinstance(desc, list):
-                desc = " ".join(str(x) for x in desc)
-
-            # Prefer high-resolution images, fall back to imUrl
-            img_url = ""
-            if d.get("imageURLHighRes"):
-                img_url = d["imageURLHighRes"][0] if d["imageURLHighRes"] else ""
-            if not img_url:
-                img_url = d.get("imUrl", "") or ""
-
-            item_meta[iid] = {
-                "text":      f"{title} {desc}".strip(),
-                "image_url": img_url,
-            }
-            meta_found += 1
-        except Exception:
-            continue
+    item_meta[iid] = {
+        "text":      f"{title} {desc}".strip(),
+        "image_url": select_image_url(d),
+    }
+    meta_found += 1
 
 print(f"Metadata matched for {meta_found:,} / {NUM_ITEMS:,} items")
 print(f"  Items without metadata (features will be zero): {NUM_ITEMS - meta_found:,}")
@@ -208,17 +191,6 @@ print(f"\nExtracting text features (batch_size=128)...")
 TEXT_BATCH = 128
 item_ids_list = list(range(NUM_ITEMS))
 
-def _get_text_embs(model, inputs):
-    """Extract (B, 512) text embeddings — compatible with transformers v4 and v5."""
-    result = model.get_text_features(**inputs)
-    if isinstance(result, torch.Tensor):
-        return result
-    # transformers v5+ may return a ModelOutput dataclass
-    if hasattr(result, "pooler_output"):
-        return model.text_projection(result.pooler_output)
-    return model.text_projection(result[1])   # fallback: index 1 = pooler_output
-
-
 with torch.no_grad():
     for start in tqdm(range(0, NUM_ITEMS, TEXT_BATCH), desc="Text"):
         batch_ids  = item_ids_list[start: start + TEXT_BATCH]
@@ -234,7 +206,7 @@ with torch.no_grad():
             max_length=77,
             padding=True,
         ).to(DEVICE)
-        embs = _get_text_embs(model, inputs)              # (B, 512)
+        embs = clip_text_embeddings(model, inputs)         # (B, 512)
         text_features[start: start + TEXT_BATCH] = embs.cpu().numpy()
 
 np.save(os.path.join(BASE, "text_feat.npy"), text_features)
@@ -259,12 +231,7 @@ with torch.no_grad():
             resp.raise_for_status()
             img  = Image.open(BytesIO(resp.content)).convert("RGB")
             inp  = processor(images=img, return_tensors="pt").to(DEVICE)
-            raw_img = model.get_image_features(**inp)
-            emb = raw_img if isinstance(raw_img, torch.Tensor) else (
-                model.visual_projection(raw_img.pooler_output)
-                if hasattr(raw_img, "pooler_output")
-                else model.visual_projection(raw_img[1])
-            )
+            emb = clip_image_embeddings(model, inp)
             image_features[iid] = emb.cpu().numpy().flatten()
             img_ok += 1
         except Exception:
