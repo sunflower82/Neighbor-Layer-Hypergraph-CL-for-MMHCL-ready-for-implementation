@@ -37,7 +37,7 @@ def build_hypergraph_laplacian(
         If None, behaviour depends on ``use_structural_weight``.
     use_structural_weight : bool
         When ``w_e`` is None and this flag is True (default), automatically
-        compute  W_e(e,e) = 1 / (1 + |e|)  as specified by TEX Eq. (1).
+        compute  W_e(e,e) = 1 / log(1 + |e|)  as specified by Rev5.1 Eq. (1).
         Set to False for uniform (all-ones) weights.
 
     Returns

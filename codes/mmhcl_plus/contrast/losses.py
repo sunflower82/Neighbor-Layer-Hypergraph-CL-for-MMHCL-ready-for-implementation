@@ -99,7 +99,7 @@ def chunked_info_nce_loss(
     chunk_size: int = 512,
     dynamic_weights: torch.Tensor | None = None,
     hard_negatives: torch.Tensor | None = None,
-    hard_neg_weight: float = 1.0,
+    hard_neg_weight: float = 0.5,
 ) -> torch.Tensor:
     """
     Memory-safe chunked InfoNCE with FAISS-guided hard negatives.
@@ -115,7 +115,9 @@ def chunked_info_nce_loss(
         chunk_size:      Number of query rows per chunk.
         dynamic_weights: Optional [B, N] float W_ema log-prior weights.
         hard_negatives:  Optional [B, K_neg, d] FAISS-mined hard negatives.
-        hard_neg_weight: Scalar weight for hard negative log-prior (default 1.0).
+        hard_neg_weight: Scalar weight for hard negative log-prior (default 0.5).
+                         Conservative value prevents hard negatives from
+                         dominating the loss before warm-up completes.
 
     Returns:
         Scalar mean cross-entropy loss.

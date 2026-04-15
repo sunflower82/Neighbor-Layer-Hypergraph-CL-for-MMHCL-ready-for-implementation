@@ -67,6 +67,10 @@ class LossConfig:
     dirichlet_weight: float = 1.0
     ego_final_weight: float = 1.0
 
+    # Hard negative weighting in InfoNCE denominator (Rev5.1 canonical: 0.5)
+    # Conservative default prevents hard negatives dominating before warm-up completes.
+    hard_neg_weight: float = 0.5
+
 
 @dataclass
 class TopologyConfig:
