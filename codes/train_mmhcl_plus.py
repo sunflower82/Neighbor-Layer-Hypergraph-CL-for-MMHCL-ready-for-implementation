@@ -28,12 +28,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from mmhcl_plus.config import load_config
 from mmhcl_plus.contrast import (
-    GradNormLossBalancer,
-    barlow_twins_loss,
+    UncertaintyLossBalancer,
     bpr_loss,
     chunked_info_nce_loss,
     soft_byol_alignment,
     temperature_free_info_nce_loss,
+    vicreg_loss,
 )
 from mmhcl_plus.model import ExpandedProjector, FusionMLP, LayerwiseEncoder, MMHCLPlus
 from mmhcl_plus.regularizers import dirichlet_energy_minibatch
@@ -180,7 +180,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[train_mmhcl_plus] torch.compile(projector) skipped: {exc}")
 
-    balancer = GradNormLossBalancer(alpha=cfg.loss.gradnorm_alpha).to(device)
+    balancer = UncertaintyLossBalancer(num_tasks=getattr(cfg.loss, 'num_tasks', 6)).to(device)
 
     # projector_u2u is already registered inside MMHCLPlus, so model.parameters()
     # already covers it.  Adding projector.parameters() again would trigger a
@@ -217,11 +217,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.temperature_free:
 
-        def infonce_fn(a, b, tau=None, dynamic_weights=None):
+        def infonce_fn(a, b, tau=None, dynamic_weights=None, hard_negatives=None, hard_neg_weight=0.5):
             return temperature_free_info_nce_loss(a, b)
     else:
 
-        def infonce_fn(a, b, tau=None, dynamic_weights=None):
+        def infonce_fn(a, b, tau=None, dynamic_weights=None, hard_negatives=None, hard_neg_weight=0.5):
             t = tau if tau is not None else cfg.loss.tau_max
             return chunked_info_nce_loss(
                 a,
@@ -229,10 +229,12 @@ def main() -> None:
                 tau=t,
                 chunk_size=cfg.loss.info_nce_chunk_size,
                 dynamic_weights=dynamic_weights,
+                hard_negatives=hard_negatives,
+                hard_neg_weight=hard_neg_weight,
             )
 
     loss_fns = {
-        "barlow": barlow_twins_loss,
+        "vicreg": vicreg_loss,
         "infonce": infonce_fn,
         "soft_byol": soft_byol_alignment,
         "bpr": bpr_loss,
@@ -316,6 +318,7 @@ def main() -> None:
 
             if step % cfg.system.log_every == 0:
                 mode = "WARMUP" if metrics["warmup"] else f"tau={metrics['tau']:.4f}"
+                ego_str = f"  ego={metrics.get('ego_final', 0.0):.4f}"
                 print(
                     f"epoch={epoch + 1:3d}/{cfg.system.epochs} "
                     f"step={step:2d} "
@@ -326,6 +329,7 @@ def main() -> None:
                     f"i2i={metrics['i2i']:.4f}  "
                     f"align={metrics['align']:.4f}  "
                     f"dir={metrics['dir']:.6f}"
+                    + ego_str
                 )
 
         n_steps = len(dataloader)

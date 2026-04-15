@@ -2,35 +2,33 @@
 main_mmhcl_plus.py — MMHCL+ (Neighbor-Layer Hypergraph CL) Training Script
 ============================================================================
 
-Full implementation of the MMHCL+ architecture (revision44), integrating all
+Full implementation of the MMHCL+ architecture (revision 5.1), integrating all
 modules from the mmhcl_plus package (codes/mmhcl_plus/):
 
   1. Neighbor-layer contrastive learning pairs (NLGCL+ approach)
-       - u2u branch : Barlow Twins between adjacent user-hypergraph layers
-       - i2i branch : Chunked InfoNCE between adjacent item-hypergraph layers
+       - u2u branch : VICReg between adjacent user-hypergraph layers
+       - i2i branch : Chunked InfoNCE with FAISS hard negatives between
+                      adjacent item-hypergraph layers
   2. Adaptive Sample Weighting (ASW) via WEMAManager — both user and item sides
-  3. Soft Topology-Aware Purification (TEX §3.4): percentile + bridge penalty
+  3. Soft Topology-Aware Purification: percentile + bridge penalty
        applied to both w_ema_i and w_ema_u after precomputation
-  4. EMA Teacher Network (TEX §4.4 Alg.1 Steps 6 & 11): momentum-updated copy
-       of the online encoder produces stop-gradient targets for Soft BYOL
-  5. Soft BYOL cross-view alignment using EMA teacher targets (not raw bipartite)
+  4. EMA Teacher Network: momentum-updated copy of the online encoder
+       produces stop-gradient targets for Soft BYOL
+  5. Soft BYOL cross-view alignment using EMA teacher targets
   6. Dirichlet energy regularisation (prevents over-smoothing)
-  7. Real GradNorm (Chen et al., ICML 2018): gradient-norm equalization across
-       5 tasks via per-task gradient norm computation w.r.t. shared parameters
-  8. Warmup epochs + exponential temperature annealing
-  9. Profiling-guided activation checkpointing (TEX §4.3 Table 2): deep layers
-       are checkpointed; shallow layers (< checkpoint_threshold) are cached for
-       neighbor-layer CL pair construction
+  7. Ego-Final Anchor: VICReg between layer 0 and layer L to prevent
+       semantic drift
+  8. Homoscedastic Uncertainty Loss Balancer (Kendall et al., 2018):
+       learnable per-task log-variance scalars for 6 objectives
+  9. Warmup epochs + exponential temperature annealing
+ 10. Profiling-guided activation checkpointing
 
 Usage (same CLI interface as main.py, plus new MMHCL+ flags):
     python main_mmhcl_plus.py --dataset Baby --seed 42 \\
-        --warmup_epochs 10 --tau_max 0.5 --tau_min 0.05 --tau_gamma 0.99 \\
+        --warmup_epochs 5 --tau_max 0.5 --tau_min 0.05 --tau_gamma 0.99 \\
         [all other original MMHCL args]
 
-Log format is intentionally identical to main.py so that the notebook's
-results-parsing cells work without modification.
-
-Reference: NLGCL-to-MMHCL-architecture_revision44_full_implementation.tex
+Reference: NLGCL-to-MMHCL-architecture_revision51_full_implementation.tex
 """
 
 from __future__ import annotations
@@ -67,10 +65,10 @@ from utility.logging import Logger
 # ── repo utilities (identical to main.py) ─────────────────────────────────────
 from utility.parser import parse_args
 
-from mmhcl_plus.contrast.gradnorm import GradNormLossBalancer
+from mmhcl_plus.contrast.uncertainty_balancer import UncertaintyLossBalancer
 
 # ── MMHCL+ package (codes/mmhcl_plus/) ────────────────────────────────────────
-from mmhcl_plus.contrast.losses import barlow_twins_loss, chunked_info_nce_loss
+from mmhcl_plus.contrast.losses import vicreg_loss, chunked_info_nce_loss
 from mmhcl_plus.contrast.neighbor_pairs import build_neighbor_layer_pairs
 from mmhcl_plus.contrast.soft_byol import soft_byol_alignment
 from mmhcl_plus.model.projector import ExpandedProjector
@@ -82,6 +80,10 @@ from mmhcl_plus.topology.dynamic_ema_weights import (
     build_item_wema,
     build_user_wema,
     update_ema_teacher,
+)
+from mmhcl_plus.topology.hard_negatives import (
+    build_interaction_mask,
+    mine_hard_negatives_faiss,
 )
 
 # ── parse args ────────────────────────────────────────────────────────────────
@@ -293,24 +295,16 @@ class MMHCLPlusTrainer:
         for p in self.ema_model.parameters():
             p.requires_grad_(False)
 
-        # Expanded projector for u2u Barlow Twins branch (TEX §4.2)
+        # Expanded projector for u2u VICReg branch (Rev5.1)
         self.projector: ExpandedProjector = ExpandedProjector(
             in_dim=self.emb_dim,
             hidden_dim=args.projector_hidden_dim,
             out_dim=args.projector_out_dim,
         ).cuda()
 
-        # GradNorm balancer (5 tasks: bpr, u2u, i2i, align, dirichlet)
-        self.balancer: GradNormLossBalancer = GradNormLossBalancer(
-            n_tasks=5,
-            alpha=args.gradnorm_alpha,
-            init_weights=[
-                args.bpr_weight,
-                args.u2u_weight,
-                args.i2i_weight,
-                args.align_weight,
-                args.dirichlet_weight,
-            ],
+        # Uncertainty balancer (6 tasks: bpr, u2u, i2i, align, dirichlet, ego_final)
+        self.balancer: UncertaintyLossBalancer = UncertaintyLossBalancer(
+            num_tasks=getattr(args, 'num_tasks', 6),
         ).cuda()
 
         # Unified optimizer (model + projector + balancer; NOT ema_model)
@@ -423,12 +417,12 @@ class MMHCLPlusTrainer:
         """
         Full training loop — mirrors Trainer.train() in structure and log format.
 
-        Key differences from Trainer.train():
+        Key differences from Trainer.train() (Rev5.1):
           - forward_plus() returns intermediate layer caches
           - CL losses are skipped during warmup_epochs
-          - After warmup: Barlow Twins (u2u) + Chunked InfoNCE (i2i) +
-            Soft BYOL alignment + Dirichlet regularisation
-          - GradNorm balances all five loss components
+          - After warmup: VICReg (u2u) + Chunked InfoNCE with hard negatives (i2i) +
+            Soft BYOL alignment + Dirichlet regularisation + Ego-Final anchor
+          - UncertaintyLossBalancer balances all six loss components
           - Temperature tau anneals exponentially from tau_max → tau_min
         """
         training_time_list: list[float] = []
@@ -480,6 +474,7 @@ class MMHCLPlusTrainer:
             i2i_acc = 0.0
             aln_acc = 0.0
             dir_acc = 0.0
+            ego_acc = 0.0
             n_batch: int = data_generator.n_train // args.batch_size + 1
 
             # ── Mini-batch loop ──────────────────────────────────────────────
@@ -524,10 +519,11 @@ class MMHCLPlusTrainer:
                     batch_i2i = torch.zeros(1, device=device)
                     batch_aln = torch.zeros(1, device=device)
                     batch_dir = torch.zeros(1, device=device)
+                    batch_ego = torch.zeros(1, device=device)
 
                 else:
-                    # ── u2u: Barlow Twins on adjacent user-hypergraph layers ──
-                    # User-side ASW: soft topology weights from w_ema_u (TEX §4.4 Listing 2)
+                    # ── u2u: VICReg on adjacent user-hypergraph layers (Rev5.1) ──
+                    # User-side ASW: soft topology weights from w_ema_u
                     user_t = torch.tensor(users, dtype=torch.long)
                     soft_w_u: torch.Tensor | None = None
                     if self.w_ema_u is not None:
@@ -539,20 +535,18 @@ class MMHCLPlusTrainer:
                         if soft_w_u.size(0) != len(users):
                             soft_w_u = None  # safety guard
 
-                    # max_hops=2 enforces the theoretical bound g ≤ 2 from TEX
-                    # Corollary 1: over-smoothing risk grows exponentially beyond
-                    # layer 2 on hypergraphs, so we restrict CL pairs to the
-                    # shallow portion of the network (l=0→1 and l=1→2 only).
                     u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=2)
                     u2u_terms: list[torch.Tensor] = []
                     for h_l, h_lp1 in u_pairs:
                         z1 = self.projector(h_l[users])
                         z2 = self.projector(h_lp1[users])
                         u2u_terms.append(
-                            barlow_twins_loss(
+                            vicreg_loss(
                                 z1,
                                 z2,
-                                lambd=args.barlow_lambda,
+                                sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
+                                var_weight=getattr(args, 'vicreg_var_weight', 25.0),
+                                cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
                                 soft_weights=soft_w_u,
                             )
                         )
@@ -563,12 +557,32 @@ class MMHCLPlusTrainer:
                     )
 
                     # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
-                    # max_hops=2 mirrors the u2u constraint; with Item_layers=2 the
-                    # list naturally has 2 pairs, so this is a no-op in practice but
-                    # ensures correctness if Item_layers is increased in future runs.
+                    # With hard negative mining (Rev5.1)
                     i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=2)
                     i2i_terms: list[torch.Tensor] = []
                     item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
+
+                    # Mine hard negatives once per step (shared across layer pairs)
+                    hard_negs: torch.Tensor | None = None
+                    n_hard = getattr(args, 'n_hard_neg', 10)
+                    if n_hard > 0 and ii_layers:
+                        with torch.no_grad():
+                            # Use final item embeddings for ANN similarity
+                            all_item_emb = ii_final.detach()
+                            batch_item_emb = all_item_emb[pos_items]
+                            interaction_mask = build_interaction_mask(
+                                batch_items=pos_items,
+                                train_items=data_generator.train_items,
+                                n_items=self.n_items,
+                                batch_users=users,
+                            ).to(device)
+                            hard_negs = mine_hard_negatives_faiss(
+                                query_embs=batch_item_emb,
+                                all_embs=all_item_emb,
+                                interaction_mask=interaction_mask,
+                                n_hard_neg=n_hard,
+                                pool_k=getattr(args, 'hard_neg_pool_k', 64),
+                            )  # [B, n_hard, d]
 
                     for h_l, h_lp1 in i_pairs:
                         q = h_l[pos_items]
@@ -593,6 +607,8 @@ class MMHCLPlusTrainer:
                                 tau=tau,
                                 chunk_size=args.info_nce_chunk_size,
                                 dynamic_weights=dyn_w,
+                                hard_negatives=hard_negs,
+                                hard_neg_weight=getattr(args, 'hard_neg_weight', 0.5),
                             )
                         )
                     batch_i2i = (
@@ -618,9 +634,6 @@ class MMHCLPlusTrainer:
                     ) + soft_byol_alignment(uu_final, u_bip_t)
 
                     # ── Dirichlet energy regularisation (mini-batch) ──────────
-                    # TEX §3.3 Corollary 1: subsample rows for E_B corresponding
-                    # to the current batch nodes, reducing the trace cost from
-                    # O(N·d) to O(B·d).  batch_idx tensors must be on device.
                     item_batch_idx = item_t  # [B_i], already on device
                     user_batch_idx = torch.tensor(
                         users, dtype=torch.long, device=device
@@ -631,18 +644,27 @@ class MMHCLPlusTrainer:
                         uu_final, self.User_mat, user_batch_idx
                     )
 
-                    # ── Real GradNorm balanced combination ───────────────────
-                    # Shared backbone parameters: embedding tables that all tasks
-                    # depend on (used to compute per-task gradient norms)
-                    shared_params = [
-                        self.model.ii_embedding.weight,
-                        self.model.uu_embedding.weight,
-                        self.model.user_ui_embedding.weight,
-                        self.model.item_ui_embedding.weight,
-                    ]
-                    batch_loss, _ = self.balancer.combine(
-                        [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir],
-                        shared_params=shared_params,
+                    # ── Ego-Final anchor: VICReg between layer 0 and layer L ──
+                    # Prevents semantic drift (Rev5.1 §3.5)
+                    ego_u = self.projector(uu_layers[0][users])
+                    fin_u = self.projector(uu_layers[-1][users])
+                    ego_i = self.projector(ii_layers[0][pos_items])
+                    fin_i = self.projector(ii_layers[-1][pos_items])
+                    batch_ego = vicreg_loss(
+                        ego_u, fin_u,
+                        sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
+                        var_weight=getattr(args, 'vicreg_var_weight', 25.0),
+                        cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
+                    ) + vicreg_loss(
+                        ego_i, fin_i,
+                        sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
+                        var_weight=getattr(args, 'vicreg_var_weight', 25.0),
+                        cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
+                    )
+
+                    # ── Uncertainty-balanced combination (6 tasks) ────────────
+                    batch_loss = self.balancer(
+                        [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir, batch_ego]
                     )
 
                 # Back-propagation
@@ -678,6 +700,7 @@ class MMHCLPlusTrainer:
                 i2i_acc += batch_i2i.item()
                 aln_acc += batch_aln.item()
                 dir_acc += batch_dir.item()
+                ego_acc += batch_ego.item()
 
             # ── End mini-batch loop ──────────────────────────────────────────
             self.lr_scheduler.step()
@@ -721,6 +744,7 @@ class MMHCLPlusTrainer:
                         "train/i2i": i2i_acc,
                         "train/align": aln_acc,
                         "train/dirichlet": dir_acc,
+                        "train/ego_final": ego_acc,
                         "train/dirichlet_raw_avg": dir_acc / max(n_batch, 1),
                         "train/tau": tau,
                         "train/warmup": int(in_warmup),
@@ -734,7 +758,7 @@ class MMHCLPlusTrainer:
             if (epoch + 1) % args.verbose != 0:
                 # Non-evaluation epoch: only log training loss
                 perf_str = (
-                    "Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s"
+                    "Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f + %.5f] %s"
                     % (
                         epoch,
                         time() - t1,
@@ -744,6 +768,7 @@ class MMHCLPlusTrainer:
                         i2i_acc / n_batch,
                         aln_acc / n_batch,
                         dir_acc / n_batch,
+                        ego_acc / n_batch,
                         phase_tag,
                     )
                 )
@@ -768,7 +793,7 @@ class MMHCLPlusTrainer:
             if args.verbose > 0:
                 perf_str = (
                     "Epoch %d [%.1fs + %.1fs]: "
-                    "train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s, "
+                    "train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f + %.5f] %s, "
                     "recall=[%.5f, %.5f], precision=[%.5f, %.5f], "
                     "hit=[%.5f, %.5f], ndcg=[%.5f, %.5f]"
                     % (
@@ -781,6 +806,7 @@ class MMHCLPlusTrainer:
                         i2i_acc / n_batch,
                         aln_acc / n_batch,
                         dir_acc / n_batch,
+                        ego_acc / n_batch,
                         phase_tag,
                         ret["recall"][0],
                         ret["recall"][-1],

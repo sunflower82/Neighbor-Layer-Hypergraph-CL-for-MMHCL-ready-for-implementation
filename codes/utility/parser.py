@@ -348,11 +348,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=10,
+        default=5,
         help="Epochs to run BPR-only warmup before enabling CL losses. "
-        "TEX §4.4 specifies 10 warmup epochs so BPR can establish "
-        "a reasonable embedding space before contrastive objectives "
-        "are applied, preventing representation collapse early in training.",
+        "Rev5.1 reduces to 5 warmup epochs (down from 10 in Rev44).",
     )
     parser.add_argument(
         "--tau_max",
@@ -374,25 +372,51 @@ def parse_args() -> argparse.Namespace:
         help="Per-epoch decay factor: tau(t) = max(tau_min, tau_max * gamma^t).",
     )
 
-    # Loss function configuration
+    # Loss function configuration (Rev5.1: VICReg replaces Barlow Twins)
     parser.add_argument(
-        "--barlow_lambda",
+        "--vicreg_sim_weight",
         type=float,
-        default=5e-3,
-        help="Off-diagonal penalty coefficient lambda for Barlow Twins (u2u branch).",
+        default=25.0,
+        help="VICReg invariance (MSE) coefficient (u2u & ego-final branches).",
+    )
+    parser.add_argument(
+        "--vicreg_var_weight",
+        type=float,
+        default=25.0,
+        help="VICReg variance (hinge) coefficient.",
+    )
+    parser.add_argument(
+        "--vicreg_cov_weight",
+        type=float,
+        default=1.0,
+        help="VICReg covariance (off-diagonal) coefficient.",
     )
     parser.add_argument(
         "--info_nce_chunk_size",
         type=int,
-        default=1024,
+        default=512,
         help="Chunk size for memory-safe chunked InfoNCE (i2i branch). "
-        "Reduce if OOM; increase for speed.",
+        "Rev5.1 default: 512 (down from 1024).",
+    )
+    parser.add_argument(
+        "--num_tasks",
+        type=int,
+        default=6,
+        help="Number of loss tasks for UncertaintyLossBalancer. "
+        "Rev5.1: 6 (BPR, u2u, i2i, align, dir, ego_final).",
+    )
+    # Backward compatibility: kept but ignored by Rev5.1 code paths
+    parser.add_argument(
+        "--barlow_lambda",
+        type=float,
+        default=5e-3,
+        help="[DEPRECATED] Barlow Twins lambda. Ignored in Rev5.1 (VICReg).",
     )
     parser.add_argument(
         "--gradnorm_alpha",
         type=float,
         default=1.5,
-        help="GradNorm alpha: higher values enforce stricter loss balance.",
+        help="[DEPRECATED] GradNorm alpha. Ignored in Rev5.1 (UncertaintyBalancer).",
     )
 
     # Per-task initial loss weights (GradNorm adjusts these dynamically at runtime)
@@ -406,7 +430,7 @@ def parse_args() -> argparse.Namespace:
         "--u2u_weight",
         type=float,
         default=1.0,
-        help="Initial weight for the u2u Barlow Twins loss term.",
+        help="Initial weight for the u2u VICReg loss term.",
     )
     parser.add_argument(
         "--i2i_weight",
@@ -422,33 +446,38 @@ def parse_args() -> argparse.Namespace:
     )
     # Audit finding: with d=64 and shallow propagation (L=2–3), the raw
     # mini-batch Dirichlet energy is only ~0.0003–0.00045, which is ~400×
-    # smaller than BPR (~0.13).  The default was 0.1 in earlier revisions,
-    # but that made the regulariser contribution negligible (~0.00003).
-    # Raising to 1.0 gives GradNorm a meaningful signal to work with.
+    # smaller than BPR (~0.13).  Raising to 1.0 gives the balancer a
+    # meaningful signal to work with.
     parser.add_argument(
         "--dirichlet_weight",
         type=float,
         default=1.0,
         help="Initial weight for the Dirichlet energy regularisation term. "
         "Set higher (1.0–10.0) when the raw energy is very small "
-        "(< 0.001) so GradNorm can balance it effectively.",
+        "(< 0.001) so the uncertainty balancer can balance it.",
+    )
+    parser.add_argument(
+        "--ego_final_weight",
+        type=float,
+        default=1.0,
+        help="Initial weight for the ego-final anchor VICReg loss (Rev5.1).",
     )
 
-    # Expanded projector for u2u branch (TEX §4.4)
-    # TEX requires 64→2048→8192 to resolve the dimensionality paradox of Barlow Twins.
+    # Expanded projector for u2u branch
+    # Rev5.1: VICReg needs only 64→512→1024 (vs Barlow's 64→2048→8192)
     parser.add_argument(
         "--projector_hidden_dim",
         type=int,
-        default=2048,
+        default=512,
         help="Hidden dimension of the expanded projector MLP (u2u branch). "
-        "TEX §4.4 requires 2048 for effective Barlow Twins cross-correlation.",
+        "Rev5.1: 512 (VICReg). Rev44: 2048 (Barlow Twins).",
     )
     parser.add_argument(
         "--projector_out_dim",
         type=int,
-        default=8192,
+        default=1024,
         help="Output dimension of the expanded projector MLP (u2u branch). "
-        "TEX §4.4 requires 8192 for the high-dimensional projection space.",
+        "Rev5.1: 1024 (VICReg). Rev44: 8192 (Barlow Twins).",
     )
 
     # WEMAManager — dynamic EMA similarity weights (TEX §4.2)
@@ -490,19 +519,54 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Profiling-guided activation checkpointing (TEX §4.3, Table 2)
-    # Default is -1 (disabled) per Revision44 spec: "the current benchmark
-    # configuration keeps this option disabled because VRAM headroom is
-    # sufficient on RTX 5090 (32 GB)".  Set to 1 only for ablation studies
-    # or on GPUs with limited VRAM where the +12% time overhead is acceptable.
     parser.add_argument(
         "--checkpoint_threshold",
         type=int,
         default=-1,
         help="Checkpoint hypergraph layers from this index onward "
-        "(0-indexed). Layers < threshold are cached for CL pairs; "
-        "layers >= threshold are recomputed during backward. "
-        "-1 (default) disables checkpointing entirely, matching "
-        "the Revision44 benchmark configuration.",
+        "(0-indexed). -1 disables checkpointing entirely.",
+    )
+
+    # =====================================================================
+    #  MMHCL+ Rev5.1 — SVD Spectral Augmentation & Hard Negatives
+    # =====================================================================
+    parser.add_argument(
+        "--use_svd_filtering",
+        type=int,
+        default=1,
+        help="1 = enable SVD spectral augmentation (filter top-K singular "
+        "values from incidence matrix); 0 = disabled.",
+    )
+    parser.add_argument(
+        "--svd_top_k",
+        type=int,
+        default=10,
+        help="Number of top singular values to zero out in SVD filtering. "
+        "These correspond to popularity-dominated directions.",
+    )
+    parser.add_argument(
+        "--n_hard_neg",
+        type=int,
+        default=10,
+        help="Number of hard negatives per query in FAISS-based mining.",
+    )
+    parser.add_argument(
+        "--hard_neg_pool_k",
+        type=int,
+        default=64,
+        help="Pool size K for ANN search when mining hard negatives.",
+    )
+    parser.add_argument(
+        "--hard_neg_weight",
+        type=float,
+        default=0.5,
+        help="Relative weight of hard negatives in the InfoNCE denominator.",
+    )
+    parser.add_argument(
+        "--temperature_free",
+        type=int,
+        default=0,
+        help="1 = use temperature-free InfoNCE; 0 = standard InfoNCE.",
     )
 
     return parser.parse_args()

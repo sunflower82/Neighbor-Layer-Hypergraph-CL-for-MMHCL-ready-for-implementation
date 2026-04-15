@@ -59,8 +59,10 @@ def build_hypergraph_laplacian(
 
     if w_e is None:
         if use_structural_weight:
-            # TEX Eq. (1): W_e(e,e) = 1 / (1 + |e|)
-            w_e = 1.0 / (1.0 + d_e)
+            # TEX Rev5.1 Eq. (1): W_e(e,e) = 1 / log(1 + |e|)
+            # Logarithmic decay provides softer penalization for massive
+            # hyperedges compared to linear inverse 1/(1+|e|).
+            w_e = 1.0 / np.log1p(d_e.astype(np.float64)).clip(min=1e-8)
         else:
             w_e = np.ones(n_edges, dtype=np.float64)
 
