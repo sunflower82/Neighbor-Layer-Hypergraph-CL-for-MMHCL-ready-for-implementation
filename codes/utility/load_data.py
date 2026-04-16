@@ -379,6 +379,7 @@ class Data:
             rowsum: torch.Tensor = torch.sum(adj, -1)
             d_inv_sqrt: torch.Tensor = torch.pow(rowsum, -0.5)
             d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.0
+            d_inv_sqrt[torch.isnan(d_inv_sqrt)] = 0.0
             d_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_inv_sqrt)
             L_norm = torch.mm(torch.mm(d_mat_inv_sqrt, adj), d_mat_inv_sqrt)
 
@@ -388,11 +389,13 @@ class Data:
             rowsum = torch.sum(adj, -1)
             d_row_inv_sqrt: torch.Tensor = torch.pow(rowsum, -0.5)
             d_row_inv_sqrt[torch.isinf(d_row_inv_sqrt)] = 0.0
+            d_row_inv_sqrt[torch.isnan(d_row_inv_sqrt)] = 0.0
             d_row_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_row_inv_sqrt)
 
             colsum: torch.Tensor = torch.sum(adj, -2)
             d_col_inv_sqrt: torch.Tensor = torch.pow(colsum, -0.5)
             d_col_inv_sqrt[torch.isinf(d_col_inv_sqrt)] = 0.0
+            d_col_inv_sqrt[torch.isnan(d_col_inv_sqrt)] = 0.0
             d_col_mat_inv_sqrt: torch.Tensor = torch.diagflat(d_col_inv_sqrt)
 
             L_norm = torch.mm(torch.mm(d_row_mat_inv_sqrt, adj), d_col_mat_inv_sqrt)
@@ -402,6 +405,7 @@ class Data:
             rowsum = torch.sum(adj, -1)
             d_inv: torch.Tensor = torch.pow(rowsum, -1)
             d_inv[torch.isinf(d_inv)] = 0.0
+            d_inv[torch.isnan(d_inv)] = 0.0
             d_mat_inv: torch.Tensor = torch.diagflat(d_inv)
             L_norm = torch.mm(d_mat_inv, adj)
 
@@ -647,6 +651,9 @@ class Data:
                     Hypergraph, top_k=args.svd_top_k
                 )
                 Hypergraph_mul = H_filtered @ H_filtered.T
+                # Clamp to non-negative: SVD filtering introduces negative
+                # entries which cause NaN in D^{-1/2} symmetric normalisation
+                Hypergraph_mul = torch.clamp(Hypergraph_mul, min=0.0)
             else:
                 Hypergraph_mul = torch.sparse.mm(
                     Hypergraph, Hypergraph.to_dense().T
@@ -728,6 +735,7 @@ class Data:
                     Hypergraph, top_k=args.svd_top_k
                 )
                 Hypergraph_mul = H_filtered @ H_filtered.T
+                Hypergraph_mul = torch.clamp(Hypergraph_mul, min=0.0)
             else:
                 Hypergraph_mul = torch.sparse.mm(
                     Hypergraph, Hypergraph.to_dense().T
@@ -835,6 +843,7 @@ class Data:
                     Hypergraph, top_k=args.svd_top_k
                 )
                 Hypergraph_mul = H_filtered @ H_filtered.T
+                Hypergraph_mul = torch.clamp(Hypergraph_mul, min=0.0)
             else:
                 Hypergraph_mul = torch.sparse.mm(
                     Hypergraph, Hypergraph.to_dense().T
