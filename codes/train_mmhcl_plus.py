@@ -180,7 +180,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[train_mmhcl_plus] torch.compile(projector) skipped: {exc}")
 
-    balancer = UncertaintyLossBalancer(num_tasks=getattr(cfg.loss, 'num_tasks', 6)).to(device)
+    balancer = UncertaintyLossBalancer(num_tasks=getattr(cfg.loss, 'num_tasks', 5)).to(device)
 
     # projector_u2u is already registered inside MMHCLPlus, so model.parameters()
     # already covers it.  Adding projector.parameters() again would trigger a
@@ -318,7 +318,6 @@ def main() -> None:
 
             if step % cfg.system.log_every == 0:
                 mode = "WARMUP" if metrics["warmup"] else f"tau={metrics['tau']:.4f}"
-                ego_str = f"  ego={metrics.get('ego_final', 0.0):.4f}"
                 print(
                     f"epoch={epoch + 1:3d}/{cfg.system.epochs} "
                     f"step={step:2d} "
@@ -329,7 +328,6 @@ def main() -> None:
                     f"i2i={metrics['i2i']:.4f}  "
                     f"align={metrics['align']:.4f}  "
                     f"dir={metrics['dir']:.6f}"
-                    + ego_str
                 )
 
         n_steps = len(dataloader)

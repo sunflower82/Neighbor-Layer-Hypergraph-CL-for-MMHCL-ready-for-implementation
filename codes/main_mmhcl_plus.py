@@ -2,7 +2,7 @@
 main_mmhcl_plus.py — MMHCL+ (Neighbor-Layer Hypergraph CL) Training Script
 ============================================================================
 
-Full implementation of the MMHCL+ architecture (revision 5.1), integrating all
+Full implementation of the MMHCL+ architecture (revision 5.2), integrating all
 modules from the mmhcl_plus package (codes/mmhcl_plus/):
 
   1. Neighbor-layer contrastive learning pairs (NLGCL+ approach)
@@ -16,19 +16,23 @@ modules from the mmhcl_plus package (codes/mmhcl_plus/):
        produces stop-gradient targets for Soft BYOL
   5. Soft BYOL cross-view alignment using EMA teacher targets
   6. Dirichlet energy regularisation (prevents over-smoothing)
-  7. Ego-Final Anchor: VICReg between layer 0 and layer L to prevent
-       semantic drift
-  8. Homoscedastic Uncertainty Loss Balancer (Kendall et al., 2018):
-       learnable per-task log-variance scalars for 6 objectives
-  9. Warmup epochs + exponential temperature annealing
+  7. Hybrid Loss Balancer: Uncertainty Weighting → GradNorm transition
+       for 5 objectives (BPR, u2u, i2i, align, dirichlet)
+  8. CL warmup ramp (linear 0→1) to prevent CL Activation Shock
+  9. Delayed FAISS hard negatives (activated after epoch 50)
  10. Profiling-guided activation checkpointing
+
+Rev5.2 removals (vs Rev5.1):
+  - Ego-Final Anchor branch (conflicts with neighbor-layer CL)
+  - Pure Uncertainty-only balancer (replaced by Hybrid)
 
 Usage (same CLI interface as main.py, plus new MMHCL+ flags):
     python main_mmhcl_plus.py --dataset Baby --seed 42 \\
-        --warmup_epochs 5 --tau_max 0.5 --tau_min 0.05 --tau_gamma 0.99 \\
+        --warmup_epochs 15 --tau_max 0.5 --tau_min 0.05 --tau_gamma 0.99 \\
+        --use_hybrid_balancer 1 --cl_ramp_epochs 20 --delay_hard_negs_epoch 50 \\
         [all other original MMHCL args]
 
-Reference: NLGCL-to-MMHCL-architecture_revision51_full_implementation.tex
+Reference: NLGCL-to-MMHCL-architecture_revision52_full_implementation.tex
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ from utility.logging import Logger
 from utility.parser import parse_args
 
 from mmhcl_plus.contrast.uncertainty_balancer import UncertaintyLossBalancer
+from mmhcl_plus.contrast.hybrid_balancer import HybridLossBalancer
 
 # ── MMHCL+ package (codes/mmhcl_plus/) ────────────────────────────────────────
 from mmhcl_plus.contrast.losses import vicreg_loss, chunked_info_nce_loss
@@ -302,10 +307,19 @@ class MMHCLPlusTrainer:
             out_dim=args.projector_out_dim,
         ).cuda()
 
-        # Uncertainty balancer (6 tasks: bpr, u2u, i2i, align, dirichlet, ego_final)
-        self.balancer: UncertaintyLossBalancer = UncertaintyLossBalancer(
-            num_tasks=getattr(args, 'num_tasks', 6),
-        ).cuda()
+        # Hybrid balancer (Rev5.2: 5 tasks — bpr, u2u, i2i, align, dirichlet)
+        use_hybrid = getattr(args, 'use_hybrid_balancer', 1)
+        if use_hybrid:
+            self.balancer = HybridLossBalancer(
+                num_tasks=getattr(args, 'num_tasks', 5),
+                alpha=getattr(args, 'gradnorm_alpha', 1.5),
+                transition_epoch=getattr(args, 'balancer_transition_epoch', 40),
+                blend_epochs=getattr(args, 'balancer_blend_epochs', 20),
+            ).cuda()
+        else:
+            self.balancer = UncertaintyLossBalancer(
+                num_tasks=getattr(args, 'num_tasks', 5),
+            ).cuda()
 
         # Unified optimizer (model + projector + balancer; NOT ema_model)
         self.optimizer: optim.Adam = optim.Adam(
@@ -413,17 +427,26 @@ class MMHCLPlusTrainer:
         return _bpr_loss(u, pos_i, neg_i, self.batch_size, self.decay)
 
     # -----------------------------------------------------------------------
+    def _get_shared_params(self) -> list[torch.Tensor]:
+        """Return shared backbone parameters for GradNorm gradient norms."""
+        params = []
+        for name, p in self.model.named_parameters():
+            if "embedding" in name and p.requires_grad:
+                params.append(p)
+        return params if params else list(self.model.parameters())[:4]
+
+    # -----------------------------------------------------------------------
     def train(self, return_validation: bool = False) -> float:
         """
         Full training loop — mirrors Trainer.train() in structure and log format.
 
-        Key differences from Trainer.train() (Rev5.1):
-          - forward_plus() returns intermediate layer caches
-          - CL losses are skipped during warmup_epochs
-          - After warmup: VICReg (u2u) + Chunked InfoNCE with hard negatives (i2i) +
-            Soft BYOL alignment + Dirichlet regularisation + Ego-Final anchor
-          - UncertaintyLossBalancer balances all six loss components
-          - Temperature tau anneals exponentially from tau_max → tau_min
+        Key differences from Rev5.1 (Rev5.2 changes):
+          - CL ramp: linear 0→1 over cl_ramp_epochs after warmup
+          - FAISS hard negatives delayed until delay_hard_negs_epoch
+          - Ego-Final Anchor removed (conflicts with neighbor-layer CL)
+          - 5-task Hybrid Balancer (Uncertainty → GradNorm transition)
+          - VICReg projector D=4096 (was 1024)
+          - Warmup epochs = 15 (was 5)
         """
         training_time_list: list[float] = []
         loss_loger: list[float] = []
@@ -442,12 +465,13 @@ class MMHCLPlusTrainer:
 
         # W&B initialisation (identical to Trainer.train)
         if args.use_wandb and wandb is not None:
+            if wandb.run is not None:
+                wandb.finish()
             wconfig = vars(args)
             wconfig["path_name"] = path_name
             winit: dict[str, Any] = {
                 "project": args.wandb_project,
                 "config": wconfig,
-                "finish_previous": True,
             }
             if args.wandb_entity:
                 winit["entity"] = args.wandb_entity
@@ -467,6 +491,20 @@ class MMHCLPlusTrainer:
             )
             in_warmup: bool = epoch < args.warmup_epochs
 
+            # Rev5.2: CL Warmup Ramp (linear 0→1 scaling)
+            cl_ramp_epochs = getattr(args, 'cl_ramp_epochs', 20)
+            delay_hard_negs_epoch = getattr(args, 'delay_hard_negs_epoch', 50)
+            if in_warmup:
+                ramp_weight = 0.0
+            else:
+                ramp_weight = min(1.0, (epoch - args.warmup_epochs) / float(max(cl_ramp_epochs, 1)))
+
+            # Rev5.2: Delayed FAISS hard negatives
+            use_hard_negs = (epoch > delay_hard_negs_epoch) and not in_warmup
+
+            # Shared params for GradNorm (Rev5.2 Hybrid Balancer)
+            shared_params = self._get_shared_params() if isinstance(self.balancer, HybridLossBalancer) else None
+
             # Epoch-level loss accumulators
             loss_acc = 0.0
             bpr_acc = 0.0
@@ -474,7 +512,6 @@ class MMHCLPlusTrainer:
             i2i_acc = 0.0
             aln_acc = 0.0
             dir_acc = 0.0
-            ego_acc = 0.0
             n_batch: int = data_generator.n_train // args.batch_size + 1
 
             # ── Mini-batch loop ──────────────────────────────────────────────
@@ -519,7 +556,6 @@ class MMHCLPlusTrainer:
                     batch_i2i = torch.zeros(1, device=device)
                     batch_aln = torch.zeros(1, device=device)
                     batch_dir = torch.zeros(1, device=device)
-                    batch_ego = torch.zeros(1, device=device)
 
                 else:
                     # ── u2u: VICReg on adjacent user-hypergraph layers (Rev5.1) ──
@@ -565,7 +601,7 @@ class MMHCLPlusTrainer:
                     # Mine hard negatives once per step (shared across layer pairs)
                     hard_negs: torch.Tensor | None = None
                     n_hard = getattr(args, 'n_hard_neg', 10)
-                    if n_hard > 0 and ii_layers:
+                    if use_hard_negs and n_hard > 0 and ii_layers:
                         with torch.no_grad():
                             # Use final item embeddings for ANN similarity
                             all_item_emb = ii_final.detach()
@@ -644,28 +680,23 @@ class MMHCLPlusTrainer:
                         uu_final, self.User_mat, user_batch_idx
                     )
 
-                    # ── Ego-Final anchor: VICReg between layer 0 and layer L ──
-                    # Prevents semantic drift (Rev5.1 §3.5)
-                    ego_u = self.projector(uu_layers[0][users])
-                    fin_u = self.projector(uu_layers[-1][users])
-                    ego_i = self.projector(ii_layers[0][pos_items])
-                    fin_i = self.projector(ii_layers[-1][pos_items])
-                    batch_ego = vicreg_loss(
-                        ego_u, fin_u,
-                        sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
-                        var_weight=getattr(args, 'vicreg_var_weight', 25.0),
-                        cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
-                    ) + vicreg_loss(
-                        ego_i, fin_i,
-                        sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
-                        var_weight=getattr(args, 'vicreg_var_weight', 25.0),
-                        cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
-                    )
+                    # ── Rev5.2: Apply CL Warmup Ramp to ALL CL losses ────────
+                    batch_u2u = batch_u2u * ramp_weight
+                    batch_i2i = batch_i2i * ramp_weight
+                    batch_aln = batch_aln * ramp_weight
+                    batch_dir = batch_dir * ramp_weight
 
-                    # ── Uncertainty-balanced combination (6 tasks) ────────────
-                    batch_loss = self.balancer(
-                        [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir, batch_ego]
-                    )
+                    # ── Rev5.2: 5-task balanced combination ───────────────────
+                    if isinstance(self.balancer, HybridLossBalancer):
+                        batch_loss = self.balancer(
+                            [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir],
+                            epoch=epoch,
+                            shared_params=shared_params,
+                        )
+                    else:
+                        batch_loss = self.balancer(
+                            [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir]
+                        )
 
                 # Back-propagation
                 batch_loss.backward(retain_graph=False)
@@ -700,7 +731,6 @@ class MMHCLPlusTrainer:
                 i2i_acc += batch_i2i.item()
                 aln_acc += batch_aln.item()
                 dir_acc += batch_dir.item()
-                ego_acc += batch_ego.item()
 
             # ── End mini-batch loop ──────────────────────────────────────────
             self.lr_scheduler.step()
@@ -744,21 +774,24 @@ class MMHCLPlusTrainer:
                         "train/i2i": i2i_acc,
                         "train/align": aln_acc,
                         "train/dirichlet": dir_acc,
-                        "train/ego_final": ego_acc,
                         "train/dirichlet_raw_avg": dir_acc / max(n_batch, 1),
                         "train/tau": tau,
+                        "train/ramp_weight": ramp_weight,
+                        "train/hard_negs_active": int(use_hard_negs),
                         "train/warmup": int(in_warmup),
                         "train/lr": self.optimizer.param_groups[0]["lr"],
                     }
                 )
 
             # Build performance string (same pattern as main.py for log compatibility)
-            phase_tag = "[WARMUP]" if in_warmup else "[tau=%.4f]" % tau
+            phase_tag = "[WARMUP]" if in_warmup else "[tau=%.4f ramp=%.2f%s]" % (
+                tau, ramp_weight, " FAISS" if use_hard_negs else "",
+            )
 
             if (epoch + 1) % args.verbose != 0:
                 # Non-evaluation epoch: only log training loss
                 perf_str = (
-                    "Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f + %.5f] %s"
+                    "Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s"
                     % (
                         epoch,
                         time() - t1,
@@ -768,7 +801,6 @@ class MMHCLPlusTrainer:
                         i2i_acc / n_batch,
                         aln_acc / n_batch,
                         dir_acc / n_batch,
-                        ego_acc / n_batch,
                         phase_tag,
                     )
                 )
@@ -793,7 +825,7 @@ class MMHCLPlusTrainer:
             if args.verbose > 0:
                 perf_str = (
                     "Epoch %d [%.1fs + %.1fs]: "
-                    "train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f + %.5f] %s, "
+                    "train==[%.5f=%.5f + %.5f + %.5f + %.5f + %.5f] %s, "
                     "recall=[%.5f, %.5f], precision=[%.5f, %.5f], "
                     "hit=[%.5f, %.5f], ndcg=[%.5f, %.5f]"
                     % (
@@ -806,7 +838,6 @@ class MMHCLPlusTrainer:
                         i2i_acc / n_batch,
                         aln_acc / n_batch,
                         dir_acc / n_batch,
-                        ego_acc / n_batch,
                         phase_tag,
                         ret["recall"][0],
                         ret["recall"][-1],

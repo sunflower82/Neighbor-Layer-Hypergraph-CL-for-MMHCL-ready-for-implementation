@@ -1,13 +1,13 @@
 """
-MMHCL+ Configuration --- Revision 5.1
+MMHCL+ Configuration --- Revision 5.2
 
-Changes from Rev44:
-  - BARLOW_PROJ_DIM=8192 -> VICREG_PROJ_DIM=1024
-  - projector_hidden_dim: 2048 -> 512
-  - Removed: barlow_lambda, gradnorm_alpha
-  - Added: vicreg_{sim,var,cov}_weight, num_tasks=6, ego_final_weight
-  - Added: TopologyConfig.use_svd_filtering, svd_top_k
-  - warmup_epochs: 10 -> 5 (Rev5.1 spec)
+Changes from Rev5.1:
+  - VICREG_PROJ_DIM: 1024 -> 4096 (reclaims decorrelation capacity)
+  - projector_hidden_dim: 512 -> 1024
+  - num_tasks: 6 -> 5 (ego-final removed)
+  - warmup_epochs: 5 -> 15
+  - ego_final_weight: deprecated (set to 0.0)
+  - Added: cl_ramp_epochs, delay_hard_negs_epoch, use_hybrid_balancer
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -15,10 +15,10 @@ from typing import Any
 
 import yaml
 
-# -- Global architectural constant (TEX Rev5.1 Section 2.5) --------------
-# VICReg projection dimension D=1024 (was BARLOW_PROJ_DIM=8192 in Rev44).
-# Eliminates O(B*D^2) cross-correlation bottleneck -> ~80% VRAM saving.
-VICREG_PROJ_DIM: int = 1024
+# -- Global architectural constant (TEX Rev5.2 Section 2.5) --------------
+# VICReg projection dimension D=4096 (was 1024 in Rev5.1).
+# Reclaims decorrelation capacity for VICReg covariance regularisation.
+VICREG_PROJ_DIM: int = 4096
 
 # Backward compatibility alias (deprecated --- will be removed in v6)
 BARLOW_PROJ_DIM: int = VICREG_PROJ_DIM
@@ -28,8 +28,8 @@ BARLOW_PROJ_DIM: int = VICREG_PROJ_DIM
 class ModelConfig:
     in_dim: int = 64
     hidden_dim: int = 64
-    projector_hidden_dim: int = 512       # was 2048 for Barlow's D=8192
-    projector_out_dim: int = VICREG_PROJ_DIM  # 1024
+    projector_hidden_dim: int = 1024      # Rev5.2: 1024 (was 512 in Rev5.1)
+    projector_out_dim: int = VICREG_PROJ_DIM  # 4096
     n_layers: int = 3
     max_g_layers: int = 2
     fusion_hidden_dim: int = 128
@@ -46,7 +46,7 @@ class LossConfig:
     tau_gamma: float = 0.99
 
     # Warmup: skip CL losses for first N epochs
-    warmup_epochs: int = 5
+    warmup_epochs: int = 15
 
     # VICReg coefficients (Bardes et al., ICLR 2022)
     vicreg_sim_weight: float = 25.0   # invariance (MSE)
@@ -56,8 +56,8 @@ class LossConfig:
     # Chunked InfoNCE
     info_nce_chunk_size: int = 512
 
-    # Homoscedastic Uncertainty Balancing --- 6 tasks
-    num_tasks: int = 6
+    # Hybrid Balancing --- 5 tasks (Rev5.2: ego-final removed)
+    num_tasks: int = 5
 
     # Per-task initial weights (informational; uncertainty balancer learns sigma_i)
     bpr_weight: float = 1.0
@@ -65,7 +65,7 @@ class LossConfig:
     i2i_weight: float = 1.0
     align_weight: float = 1.0
     dirichlet_weight: float = 1.0
-    ego_final_weight: float = 1.0
+    ego_final_weight: float = 0.0  # [DEPRECATED Rev5.2] Ego-final anchor removed
 
     # Hard negative weighting in InfoNCE denominator (Rev5.1 canonical: 0.5)
     # Conservative default prevents hard negatives dominating before warm-up completes.

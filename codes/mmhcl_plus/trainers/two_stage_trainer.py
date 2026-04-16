@@ -1,24 +1,25 @@
 """
-Two-Stage Contrastive Learning Trainer --- Revision 5.1
+Two-Stage Contrastive Learning Trainer --- Revision 5.2
 
-Algorithm 1 decomposed into three phases per mini-batch:
+Algorithm 1 decomposed into two phases per mini-batch:
 
-  Stage 1 --- Intra-branch CL (only after warmup):
-    u2u branch: VICReg on ExpandedProjector outputs (D=1024).
-    i2i branch: Chunked InfoNCE with FAISS hard negatives + temperature tau(t).
+  Stage 1 --- Intra-branch CL (only after warmup, with CL ramp):
+    u2u branch: VICReg on ExpandedProjector outputs (D=4096).
+    i2i branch: Chunked InfoNCE with delayed FAISS hard negatives + temperature tau(t).
 
-  Stage 2 --- Cross-branch Alignment + Ego-Final Anchoring:
+  Stage 2 --- Cross-branch Alignment:
     Soft BYOL between final hypergraph embedding and EMA teacher target.
-    Ego-Final Anchor: VICReg between Layer 0 and Layer L embeddings.
 
   Aggregation:
-    All 6 losses combined by Homoscedastic Uncertainty Balancer (single backward).
+    All 5 losses combined by Hybrid Balancer (Uncertainty → GradNorm transition).
 
-Changes from Rev44:
-  - Barlow Twins -> VICReg (u2u + ego-final)
-  - GradNorm (5 tasks) -> UncertaintyLossBalancer (6 tasks)
-  - Added ego-final anchor loss (L_ego_final)
-  - Added hard_negatives support in i2i branch
+Changes from Rev5.1:
+  - Removed Ego-Final Anchor (conflicts with neighbor-layer CL)
+  - 6 tasks -> 5 tasks (BPR, u2u, i2i, align, dirichlet)
+  - VICReg projector D: 1024 -> 4096
+  - Added CL warmup ramp (linear 0→1)
+  - Added delayed FAISS hard negatives
+  - Hybrid Balancer replaces Uncertainty-only
 """
 
 from __future__ import annotations
@@ -35,14 +36,14 @@ from ..topology.dynamic_ema_weights import WEMAManager, update_ema_teacher
 
 class TwoStageTrainer:
     """
-    Manages one training step of MMHCL+ (Rev5.1).
+    Manages one training step of MMHCL+ (Rev5.2).
 
     Args:
         model:         MMHCLPlus instance.
         optimizer:     Optimiser covering model + projector + balancer params.
-        balancer:      UncertaintyLossBalancer (6 tasks).
+        balancer:      Loss balancer (HybridLossBalancer or UncertaintyLossBalancer, 5 tasks).
         cfg:           MMHCLPlusConfig dataclass.
-        projector:     ExpandedProjector for VICReg (d -> D=1024).
+        projector:     ExpandedProjector for VICReg (d -> D=4096).
         w_ema_u:       Optional WEMAManager for user-side soft weights.
         w_ema_i:       Optional WEMAManager for item-side soft weights.
     """
@@ -129,7 +130,6 @@ class TwoStageTrainer:
 
             loss_u = out["hyper_final"].new_tensor(0.0)
             loss_i = out["bip_final"].new_tensor(0.0)
-            loss_ego = out["hyper_final"].new_tensor(0.0)
 
             if not self._in_warmup():
                 tau = self.current_tau()
@@ -206,22 +206,6 @@ class TwoStageTrainer:
                 if i_terms:
                     loss_i = torch.stack(i_terms).mean()
 
-                # -- Ego-Final Anchor: VICReg between Layer 0 and Layer L --
-                hyper_layers = out["hyper_layers"]
-                if len(hyper_layers) >= 2:
-                    ego_emb = hyper_layers[0]   # Layer 0
-                    final_emb = hyper_layers[-1]  # Layer L
-                    if n_u is not None and n_u < ego_emb.size(0):
-                        ego_emb = ego_emb[:n_u]
-                        final_emb = final_emb[:n_u]
-                    loss_ego = loss_fns["vicreg"](
-                        self.projector(ego_emb),
-                        self.projector(final_emb.detach()),
-                        sim_weight=getattr(lc, "vicreg_sim_weight", 25.0),
-                        var_weight=getattr(lc, "vicreg_var_weight", 25.0),
-                        cov_weight=getattr(lc, "vicreg_cov_weight", 1.0),
-                    )
-
             align_weights = batch.get("align_weights")
             loss_align = loss_fns["soft_byol"](
                 out["hyper_final"], out["bip_final"], align_weights
@@ -235,9 +219,9 @@ class TwoStageTrainer:
         )
 
         # ----------------------------------------------------------------
-        # Aggregation via Homoscedastic Uncertainty Balancer (6 tasks)
+        # Aggregation via Balancer (5 tasks, Rev5.2)
         # ----------------------------------------------------------------
-        raw_losses = [loss_bpr, loss_u, loss_i, loss_align, loss_dir, loss_ego]
+        raw_losses = [loss_bpr, loss_u, loss_i, loss_align, loss_dir]
         total = self.balancer(raw_losses)
 
         # ----------------------------------------------------------------
@@ -298,7 +282,6 @@ class TwoStageTrainer:
             "i2i": float(loss_i.detach().cpu()),
             "align": float(loss_align.detach().cpu()),
             "dir": float(loss_dir.detach().cpu()),
-            "ego_final": float(loss_ego.detach().cpu()),
             "tau": self.current_tau(),
             "warmup": self._in_warmup(),
             "uncertainty_weights": unc_weights,

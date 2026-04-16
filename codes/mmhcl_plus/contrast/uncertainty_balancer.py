@@ -24,10 +24,10 @@ class UncertaintyLossBalancer(nn.Module):
     Parameters
     ----------
     num_tasks : int
-        Number of loss components (default: 6 for Rev5.1).
+        Number of loss components (default: 5 for Rev5.2).
     """
 
-    def __init__(self, num_tasks: int = 6) -> None:
+    def __init__(self, num_tasks: int = 5) -> None:
         super().__init__()
         # log(sigma^2) parameterization for numerical stability
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))

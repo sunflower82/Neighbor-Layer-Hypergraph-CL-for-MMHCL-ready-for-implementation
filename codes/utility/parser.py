@@ -348,9 +348,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=5,
+        default=15,
         help="Epochs to run BPR-only warmup before enabling CL losses. "
-        "Rev5.1 reduces to 5 warmup epochs (down from 10 in Rev44).",
+        "Rev5.2 increases to 15 warmup epochs (up from 5 in Rev5.1).",
     )
     parser.add_argument(
         "--tau_max",
@@ -401,9 +401,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num_tasks",
         type=int,
-        default=6,
-        help="Number of loss tasks for UncertaintyLossBalancer. "
-        "Rev5.1: 6 (BPR, u2u, i2i, align, dir, ego_final).",
+        default=5,
+        help="Number of loss tasks for the balancer. "
+        "Rev5.2: 5 (BPR, u2u, i2i, align, dir). Ego-final removed.",
     )
     # Backward compatibility: kept but ignored by Rev5.1 code paths
     parser.add_argument(
@@ -416,7 +416,7 @@ def parse_args() -> argparse.Namespace:
         "--gradnorm_alpha",
         type=float,
         default=1.5,
-        help="[DEPRECATED] GradNorm alpha. Ignored in Rev5.1 (UncertaintyBalancer).",
+        help="GradNorm restoring force exponent (used in HybridLossBalancer).",
     )
 
     # Per-task initial loss weights (GradNorm adjusts these dynamically at runtime)
@@ -459,8 +459,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ego_final_weight",
         type=float,
-        default=1.0,
-        help="Initial weight for the ego-final anchor VICReg loss (Rev5.1).",
+        default=0.0,
+        help="[DEPRECATED Rev5.2] Ego-final anchor removed.",
     )
 
     # Expanded projector for u2u branch
@@ -468,16 +468,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--projector_hidden_dim",
         type=int,
-        default=512,
+        default=1024,
         help="Hidden dimension of the expanded projector MLP (u2u branch). "
-        "Rev5.1: 512 (VICReg). Rev44: 2048 (Barlow Twins).",
+        "Rev5.2: 1024 (VICReg D=4096). Rev5.1: 512.",
     )
     parser.add_argument(
         "--projector_out_dim",
         type=int,
-        default=1024,
+        default=4096,
         help="Output dimension of the expanded projector MLP (u2u branch). "
-        "Rev5.1: 1024 (VICReg). Rev44: 8192 (Barlow Twins).",
+        "Rev5.2: 4096 (reclaims decorrelation capacity). Rev5.1: 1024.",
     )
 
     # WEMAManager — dynamic EMA similarity weights (TEX §4.2)
@@ -567,6 +567,43 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="1 = use temperature-free InfoNCE; 0 = standard InfoNCE.",
+    )
+
+    # =====================================================================
+    #  MMHCL+ Rev5.2 — CL Ramp, Delayed FAISS, Hybrid Balancer
+    # =====================================================================
+    parser.add_argument(
+        "--cl_ramp_epochs",
+        type=int,
+        default=20,
+        help="Epochs to linearly ramp CL losses 0->1 after warmup. "
+        "Prevents CL Activation Shock.",
+    )
+    parser.add_argument(
+        "--delay_hard_negs_epoch",
+        type=int,
+        default=50,
+        help="Epoch at which FAISS hard negatives activate. "
+        "Before this epoch: in-batch negatives only.",
+    )
+    parser.add_argument(
+        "--use_hybrid_balancer",
+        type=int,
+        default=1,
+        help="1=Hybrid Balancer (Uncertainty->GradNorm); "
+        "0=Uncertainty-only fallback.",
+    )
+    parser.add_argument(
+        "--balancer_transition_epoch",
+        type=int,
+        default=40,
+        help="Epoch to begin transitioning from Uncertainty to GradNorm.",
+    )
+    parser.add_argument(
+        "--balancer_blend_epochs",
+        type=int,
+        default=20,
+        help="Epochs to blend Uncertainty->GradNorm.",
     )
 
     return parser.parse_args()

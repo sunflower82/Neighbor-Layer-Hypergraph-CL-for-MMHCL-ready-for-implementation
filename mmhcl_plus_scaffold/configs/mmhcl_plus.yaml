@@ -1,0 +1,69 @@
+# MMHCL+ configuration — Rev5.2
+# Aligns with MMHCLPlusConfig dataclass in mmhcl_plus/config.py
+# All values override the dataclass defaults; missing keys fall back to defaults.
+
+model:
+  in_dim: 64
+  hidden_dim: 64
+  projector_hidden_dim: 1024       # Rev5.2: was 512 in Rev5.1
+  projector_out_dim: 4096          # Rev5.2: was 1024 in Rev5.1
+  n_layers: 3
+  max_g_layers: 2                  # g ≤ 2 per Corollary 1 (TEX §3.3)
+  fusion_hidden_dim: 128
+  use_checkpoint: true
+
+loss:
+  # Temperature schedule: τ(t) = max(τ_min, τ_max · γ^t)
+  tau: 0.2                         # kept for backward-compat; overridden by tau_max
+  tau_max: 0.5
+  tau_min: 0.05
+  tau_gamma: 0.99
+  # Skip CL losses during BPR warmup
+  warmup_epochs: 15                # Rev5.2: was 5 in Rev5.1
+  # VICReg coefficients (Rev5.1+)
+  vicreg_sim_weight: 25.0
+  vicreg_var_weight: 25.0
+  vicreg_cov_weight: 1.0
+  # Chunked InfoNCE
+  info_nce_chunk_size: 512
+  # Number of tasks (Rev5.2: ego-final removed)
+  num_tasks: 5
+  # Per-task loss weights (initial values)
+  dirichlet_weight: 1.0
+  bpr_weight: 1.0
+  u2u_weight: 1.0
+  i2i_weight: 1.0
+  align_weight: 1.0
+  ego_final_weight: 0.0            # DEPRECATED in Rev5.2
+  # Rev5.2: CL ramp and delayed FAISS
+  cl_ramp_epochs: 20
+  delay_hard_negs_epoch: 50
+  # Rev5.2: Hybrid Balancer (Uncertainty → GradNorm)
+  use_hybrid_balancer: 1
+  balancer_transition_epoch: 40
+  balancer_blend_epochs: 20
+  gradnorm_alpha: 1.5
+
+topology:
+  # W_ema purification: 'auto' uses FAISS GPU when installed (Optimization Report Opt. 3)
+  ann_backend: auto
+  ann_k: 32
+  ann_metric: ip
+  purification_tau: 0.2
+  ema_momentum: 0.99               # BYOL-style teacher momentum
+  w_ema_alpha: 0.9                 # W_ema EMA blend coefficient α
+  update_interval: 5               # W_ema lazy update every T epochs
+
+system:
+  device: cuda
+  seed: 2026
+  checkpoint_layers: [1, 2]       # apply activation checkpointing to layers 1 and 2
+  log_every: 1
+  epochs: 15                       # increase for real training (warmup=5 leaves 10 CL epochs)
+  lr: 0.001
+  # Performance (MMHCL_Plus_Optimization_Report.tex)
+  amp_dtype: off                  # off | bf16 | fp16  (bf16 recommended on Ampere+)
+  grad_clip_max_norm: 1.0         # 0.0 disables
+  dataloader_num_workers: 0       # use 2–4 with a real Dataset (not Dummy closure batches)
+  dataloader_prefetch_factor: 2
+  compile_projector: false        # true if PyTorch 2.x + stable batch shapes
