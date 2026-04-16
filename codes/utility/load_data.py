@@ -44,6 +44,7 @@ import scipy.sparse as sp
 from utility.common import sparse_mx_to_torch_sparse_tensor as _sparse_mx_to_torch
 from utility.norm import build_sim as _build_sim
 from utility.parser import parse_args
+from mmhcl_plus.topology.svd_augmentation import svd_filter_incidence
 
 args: argparse.Namespace = parse_args()
 
@@ -613,26 +614,48 @@ class Data:
         """
         Build the final item-item multi-modal hypergraph:  H · H^T
 
+        If args.use_svd_filtering is enabled, the incidence matrix H is
+        SVD-filtered (top-K singular values zeroed) before multiplication,
+        producing H̃ · H̃^T per Rev5.2 Section 2.2.
+
         Shape: (n_items × n_items), sparse.
         """
+        svd_tag: str = (
+            f"_svd{args.svd_top_k}" if getattr(args, "use_svd_filtering", 0) else ""
+        )
+        cache_name: str = (
+            f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{args.topk}{svd_tag}.pth"
+        )
         print(
-            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}"
+            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})"
+            f"_topk:{args.topk}{svd_tag}"
         )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
-            Hypergraph_mul = _torch_load(
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth"
-            )
+            Hypergraph_mul = _torch_load(cache_name)
         except Exception:
             Hypergraph: torch.Tensor = self.get_I2I_Hypergrah_mat("origin")
-            Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
+
+            # ── SVD Spectral Augmentation (Rev5.2) ──────────────────────
+            if getattr(args, "use_svd_filtering", 0):
+                print(
+                    f"  Applying SVD filtering: zeroing top-{args.svd_top_k} "
+                    "singular values of incidence matrix H"
+                )
+                H_filtered: torch.Tensor = svd_filter_incidence(
+                    Hypergraph, top_k=args.svd_top_k
+                )
+                Hypergraph_mul = H_filtered @ H_filtered.T
+            else:
+                Hypergraph_mul = torch.sparse.mm(
+                    Hypergraph, Hypergraph.to_dense().T
+                )
+            # ────────────────────────────────────────────────────────────
+
             Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
             Hypergraph_mul = Hypergraph_mul.to_sparse()
-            torch.save(
-                Hypergraph_mul,
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth",
-            )
+            torch.save(Hypergraph_mul, cache_name)
         print(
             "End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t)
             + norm_type
@@ -679,25 +702,40 @@ class Data:
 
     def get_I2I_Hypergraph_mul_mat_pt(self, norm_type: str = "sym") -> torch.Tensor:
         """Same as get_I2I_Hypergraph_mul_mat() but uses .pt features."""
+        svd_tag: str = (
+            f"_svd{args.svd_top_k}" if getattr(args, "use_svd_filtering", 0) else ""
+        )
+        cache_name: str = (
+            f"{self.path}/hypergraph_mat_mul{norm_type}{svd_tag}.pth"
+        )
         print(
-            "Loading I2I multi-media Hypergraph mul mat*mat.T pytorch:("
-            + norm_type
-            + ")"
+            f"Loading I2I multi-media Hypergraph mul mat*mat.T pytorch:"
+            f"({norm_type}){svd_tag}"
         )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
-            Hypergraph_mul = _torch_load(
-                self.path + "/hypergraph_mat_mul" + norm_type + ".pth"
-            )
+            Hypergraph_mul = _torch_load(cache_name)
         except Exception:
             Hypergraph: torch.Tensor = self.get_I2I_Hypergrah_mat_pt("origin")
-            Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
+
+            if getattr(args, "use_svd_filtering", 0):
+                print(
+                    f"  Applying SVD filtering: zeroing top-{args.svd_top_k} "
+                    "singular values of incidence matrix H"
+                )
+                H_filtered: torch.Tensor = svd_filter_incidence(
+                    Hypergraph, top_k=args.svd_top_k
+                )
+                Hypergraph_mul = H_filtered @ H_filtered.T
+            else:
+                Hypergraph_mul = torch.sparse.mm(
+                    Hypergraph, Hypergraph.to_dense().T
+                )
+
             Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
             Hypergraph_mul = Hypergraph_mul.to_sparse()
-            torch.save(
-                Hypergraph_mul, self.path + "/hypergraph_mat_mul" + norm_type + ".pth"
-            )
+            torch.save(Hypergraph_mul, cache_name)
         print(
             "End Load I2I multi-media Hypergraph mul mat*mat.T pytorch:[%.1fs]("
             % (time() - t)
@@ -771,24 +809,40 @@ class Data:
 
         Shape: (n_items × n_items), sparse.
         """
+        svd_tag: str = (
+            f"_svd{args.svd_top_k}" if getattr(args, "use_svd_filtering", 0) else ""
+        )
+        cache_name: str = (
+            f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{args.topk}{svd_tag}.pth"
+        )
         print(
-            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})_topk:{str(args.topk)}"
+            f"Loading I2I multi-media Hypergraph mul mat*mat.T:({norm_type})"
+            f"_topk:{args.topk}{svd_tag}"
         )
         t: float = time()
         Hypergraph_mul: torch.Tensor
         try:
-            Hypergraph_mul = _torch_load(
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth"
-            )
+            Hypergraph_mul = _torch_load(cache_name)
         except Exception:
             Hypergraph: torch.Tensor = self.get_tiktok_I2I_Hypergrah_mat("origin")
-            Hypergraph_mul = torch.sparse.mm(Hypergraph, Hypergraph.to_dense().T)
+
+            if getattr(args, "use_svd_filtering", 0):
+                print(
+                    f"  Applying SVD filtering: zeroing top-{args.svd_top_k} "
+                    "singular values of incidence matrix H"
+                )
+                H_filtered: torch.Tensor = svd_filter_incidence(
+                    Hypergraph, top_k=args.svd_top_k
+                )
+                Hypergraph_mul = H_filtered @ H_filtered.T
+            else:
+                Hypergraph_mul = torch.sparse.mm(
+                    Hypergraph, Hypergraph.to_dense().T
+                )
+
             Hypergraph_mul = self.norm_dense(Hypergraph_mul, norm_type)
             Hypergraph_mul = Hypergraph_mul.to_sparse()
-            torch.save(
-                Hypergraph_mul,
-                f"{self.path}/hypergraph_mat_mul_{norm_type}_topk_{str(args.topk)}.pth",
-            )
+            torch.save(Hypergraph_mul, cache_name)
         print(
             "End Load I2I multi-media Hypergraph mul mat*mat.T:[%.1fs](" % (time() - t)
             + norm_type
