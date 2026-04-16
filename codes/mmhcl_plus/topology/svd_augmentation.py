@@ -37,7 +37,7 @@ def svd_filter_incidence(
     if sp.issparse(H):
         H_dense = H.toarray()
     elif isinstance(H, torch.Tensor):
-        H_dense = H.detach().cpu().numpy()
+        H_dense = H.to_dense().detach().cpu().numpy()
     else:
         H_dense = np.asarray(H)
 
