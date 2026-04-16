@@ -88,10 +88,11 @@ def build_interaction_mask(
     if batch_users is None:
         return None
 
-    B = batch_items.size(0)
+    B = len(batch_items)
     mask = torch.zeros(B, n_items, dtype=torch.bool)
 
-    for i, uid in enumerate(batch_users.cpu().tolist()):
+    user_list = batch_users.cpu().tolist() if isinstance(batch_users, torch.Tensor) else batch_users
+    for i, uid in enumerate(user_list):
         interacted = train_items.get(uid, [])
         if interacted:
             mask[i, interacted] = True
