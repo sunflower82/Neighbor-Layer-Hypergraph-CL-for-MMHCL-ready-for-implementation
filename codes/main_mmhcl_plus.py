@@ -87,6 +87,7 @@ from mmhcl_plus.topology.dynamic_ema_weights import (
     update_ema_teacher,
 )
 from mmhcl_plus.topology.hard_negatives import (
+    HardNegativeMiner,
     build_interaction_mask,
     mine_hard_negatives_faiss,
 )
@@ -300,6 +301,16 @@ class MMHCLPlusTrainer:
         for p in self.ema_model.parameters():
             p.requires_grad_(False)
 
+        # ── Rev5.2-OPT: torch.compile wrapper (preserves architecture) ────
+        USE_COMPILE = os.environ.get("MMHCL_COMPILE", "1") == "1"
+        COMPILE_MODE = os.environ.get("MMHCL_COMPILE_MODE", "default")
+        if USE_COMPILE and hasattr(torch, "compile"):
+            try:
+                self.model = torch.compile(self.model, mode=COMPILE_MODE, dynamic=False)
+                print(f"[Rev5.2-OPT] torch.compile enabled mode={COMPILE_MODE}")
+            except Exception as e:
+                print(f"[Rev5.2-OPT] torch.compile disabled: {e}")
+
         # Expanded projector for u2u VICReg branch (Rev5.1)
         self.projector: ExpandedProjector = ExpandedProjector(
             in_dim=self.emb_dim,
@@ -480,6 +491,12 @@ class MMHCLPlusTrainer:
             wandb.init(**winit)
             self.logger.logging("W&B run initialized: %s" % wandb.run.name)
 
+        # ── AMP: GradScaler for mixed-precision training ─────────────────────
+        USE_AMP = os.environ.get("MMHCL_AMP", "1") == "1"
+        amp_scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+        if USE_AMP:
+            self.logger.logging("[Rev5.2-OPT] AMP enabled (float16 autocast)")
+
         # ── Epoch loop ──────────────────────────────────────────────────────
         for epoch in range(args.epoch):
             t1 = time()
@@ -518,189 +535,193 @@ class MMHCLPlusTrainer:
             for _ in range(n_batch):
                 self.model.train()
                 self.projector.train()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
                 # BPR sampling
                 users, pos_items, neg_items = data_generator.sample()
 
-                # Forward pass — student (online) network with checkpointing
-                (
-                    u_final,
-                    i_final,
-                    ii_final,
-                    uu_final,
-                    ii_layers,
-                    uu_layers,
-                    u_bip,
-                    i_bip,
-                ) = self.model.forward_plus(
-                    self.UI_mat,
-                    self.Item_mat,
-                    self.User_mat,
-                    checkpoint_threshold=args.checkpoint_threshold,
-                )
+                # ── AMP autocast: wraps forward + loss (NOT backward) ────────
+                with torch.amp.autocast("cuda", enabled=USE_AMP):
 
-                # BPR loss
-                u_g = u_final[users]
-                pos_g = i_final[pos_items]
-                neg_g = i_final[neg_items]
-                batch_mf, batch_emb, _ = self.bpr_loss(u_g, pos_g, neg_g)
-                bpr_term = batch_mf + batch_emb
-
-                device = u_final.device
-
-                if in_warmup:
-                    # Warmup: only BPR
-                    batch_loss = bpr_term
-                    batch_u2u = torch.zeros(1, device=device)
-                    batch_i2i = torch.zeros(1, device=device)
-                    batch_aln = torch.zeros(1, device=device)
-                    batch_dir = torch.zeros(1, device=device)
-
-                else:
-                    # ── u2u: VICReg on adjacent user-hypergraph layers (Rev5.1) ──
-                    # User-side ASW: soft topology weights from w_ema_u
-                    user_t = torch.tensor(users, dtype=torch.long)
-                    soft_w_u: torch.Tensor | None = None
-                    if self.w_ema_u is not None:
-                        u_rows = self.w_ema_u.get_batch_weights(
-                            user_t.cpu(), device=device
-                        )
-                        # Mean over neighbor dimension → per-user importance scalar [B]
-                        soft_w_u = u_rows.mean(dim=-1)
-                        if soft_w_u.size(0) != len(users):
-                            soft_w_u = None  # safety guard
-
-                    u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=2)
-                    u2u_terms: list[torch.Tensor] = []
-                    for h_l, h_lp1 in u_pairs:
-                        z1 = self.projector(h_l[users])
-                        z2 = self.projector(h_lp1[users])
-                        u2u_terms.append(
-                            vicreg_loss(
-                                z1,
-                                z2,
-                                sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
-                                var_weight=getattr(args, 'vicreg_var_weight', 25.0),
-                                cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
-                                soft_weights=soft_w_u,
-                            )
-                        )
-                    batch_u2u = (
-                        torch.stack(u2u_terms).mean()
-                        if u2u_terms
-                        else torch.zeros(1, device=device)
+                    # Forward pass — student (online) network with checkpointing
+                    (
+                        u_final,
+                        i_final,
+                        ii_final,
+                        uu_final,
+                        ii_layers,
+                        uu_layers,
+                        u_bip,
+                        i_bip,
+                    ) = self.model.forward_plus(
+                        self.UI_mat,
+                        self.Item_mat,
+                        self.User_mat,
+                        checkpoint_threshold=args.checkpoint_threshold,
                     )
 
-                    # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
-                    # With hard negative mining (Rev5.1)
-                    i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=2)
-                    i2i_terms: list[torch.Tensor] = []
-                    item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
+                    # BPR loss
+                    u_g = u_final[users]
+                    pos_g = i_final[pos_items]
+                    neg_g = i_final[neg_items]
+                    batch_mf, batch_emb, _ = self.bpr_loss(u_g, pos_g, neg_g)
+                    bpr_term = batch_mf + batch_emb
 
-                    # Mine hard negatives once per step (shared across layer pairs)
-                    hard_negs: torch.Tensor | None = None
-                    n_hard = getattr(args, 'n_hard_neg', 10)
-                    if use_hard_negs and n_hard > 0 and ii_layers:
-                        with torch.no_grad():
-                            # Use final item embeddings for ANN similarity
-                            all_item_emb = ii_final.detach()
-                            batch_item_emb = all_item_emb[pos_items]
-                            interaction_mask = build_interaction_mask(
-                                batch_items=pos_items,
-                                train_items=data_generator.train_items,
-                                n_items=self.n_items,
-                                batch_users=users,
-                            ).to(device)
-                            hard_negs = mine_hard_negatives_faiss(
-                                query_embs=batch_item_emb,
-                                all_embs=all_item_emb,
-                                interaction_mask=interaction_mask,
-                                n_hard_neg=n_hard,
-                                pool_k=getattr(args, 'hard_neg_pool_k', 64),
-                            )  # [B, n_hard, d]
+                    device = u_final.device
 
-                    for h_l, h_lp1 in i_pairs:
-                        q = h_l[pos_items]
-                        k = h_lp1[pos_items]
+                    if in_warmup:
+                        # Warmup: only BPR
+                        batch_loss = bpr_term
+                        batch_u2u = torch.zeros(1, device=device)
+                        batch_i2i = torch.zeros(1, device=device)
+                        batch_aln = torch.zeros(1, device=device)
+                        batch_dir = torch.zeros(1, device=device)
 
-                        # Adaptive sample weighting from W_ema (item-side only)
-                        dyn_w: torch.Tensor | None = None
-                        if self.w_ema_i is not None:
-                            w_rows = self.w_ema_i.get_batch_weights(
-                                item_t.cpu(), device=device
-                            )  # [B, n_items]
-                            col_idx = item_t.cpu().long()
-                            if col_idx.max() < w_rows.size(1):
-                                dyn_w = w_rows[:, col_idx].to(device)  # [B, B]
-                                if dyn_w.size(0) != q.size(0):
-                                    dyn_w = None  # safety guard
-
-                        i2i_terms.append(
-                            chunked_info_nce_loss(
-                                q,
-                                k,
-                                tau=tau,
-                                chunk_size=args.info_nce_chunk_size,
-                                dynamic_weights=dyn_w,
-                                hard_negatives=hard_negs,
-                                hard_neg_weight=getattr(args, 'hard_neg_weight', 0.5),
-                            )
-                        )
-                    batch_i2i = (
-                        torch.stack(i2i_terms).mean()
-                        if i2i_terms
-                        else torch.zeros(1, device=device)
-                    )
-
-                    # ── Soft BYOL cross-view alignment via EMA teacher ────────
-                    # Teacher produces stable stop-gradient targets (TEX §4.4 Alg.1 Step 6)
-                    # sg(f_ξ(B^(L))) — the EMA model runs without grad
-                    with torch.no_grad():
-                        (_, _, ii_final_t, uu_final_t, _, _, u_bip_t, i_bip_t) = (
-                            self.ema_model.forward_plus(
-                                self.UI_mat,
-                                self.Item_mat,
-                                self.User_mat,
-                                checkpoint_threshold=-1,  # no checkpointing in teacher
-                            )
-                        )
-                    batch_aln = soft_byol_alignment(
-                        ii_final, i_bip_t
-                    ) + soft_byol_alignment(uu_final, u_bip_t)
-
-                    # ── Dirichlet energy regularisation (mini-batch) ──────────
-                    item_batch_idx = item_t  # [B_i], already on device
-                    user_batch_idx = torch.tensor(
-                        users, dtype=torch.long, device=device
-                    )  # [B_u]
-                    batch_dir = _sparse_dirichlet_energy_batch(
-                        ii_final, self.Item_mat, item_batch_idx
-                    ) + _sparse_dirichlet_energy_batch(
-                        uu_final, self.User_mat, user_batch_idx
-                    )
-
-                    # ── Rev5.2: Apply CL Warmup Ramp to ALL CL losses ────────
-                    batch_u2u = batch_u2u * ramp_weight
-                    batch_i2i = batch_i2i * ramp_weight
-                    batch_aln = batch_aln * ramp_weight
-                    batch_dir = batch_dir * ramp_weight
-
-                    # ── Rev5.2: 5-task balanced combination ───────────────────
-                    if isinstance(self.balancer, HybridLossBalancer):
-                        batch_loss = self.balancer(
-                            [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir],
-                            epoch=epoch,
-                            shared_params=shared_params,
-                        )
                     else:
-                        batch_loss = self.balancer(
-                            [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir]
+                        # ── u2u: VICReg on adjacent user-hypergraph layers (Rev5.1) ──
+                        # User-side ASW: soft topology weights from w_ema_u
+                        user_t = torch.tensor(users, dtype=torch.long)
+                        soft_w_u: torch.Tensor | None = None
+                        if self.w_ema_u is not None:
+                            u_rows = self.w_ema_u.get_batch_weights(
+                                user_t.cpu(), device=device
+                            )
+                            # Mean over neighbor dimension → per-user importance scalar [B]
+                            soft_w_u = u_rows.mean(dim=-1)
+                            if soft_w_u.size(0) != len(users):
+                                soft_w_u = None  # safety guard
+
+                        u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=2)
+                        u2u_terms: list[torch.Tensor] = []
+                        for h_l, h_lp1 in u_pairs:
+                            z1 = self.projector(h_l[users])
+                            z2 = self.projector(h_lp1[users])
+                            u2u_terms.append(
+                                vicreg_loss(
+                                    z1,
+                                    z2,
+                                    sim_weight=getattr(args, 'vicreg_sim_weight', 25.0),
+                                    var_weight=getattr(args, 'vicreg_var_weight', 25.0),
+                                    cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
+                                    soft_weights=soft_w_u,
+                                )
+                            )
+                        batch_u2u = (
+                            torch.stack(u2u_terms).mean()
+                            if u2u_terms
+                            else torch.zeros(1, device=device)
                         )
 
-                # Back-propagation
-                batch_loss.backward(retain_graph=False)
-                self.optimizer.step()
+                        # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
+                        # With hard negative mining (Rev5.1)
+                        i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=2)
+                        i2i_terms: list[torch.Tensor] = []
+                        item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
+
+                        # Mine hard negatives once per step (shared across layer pairs)
+                        hard_negs: torch.Tensor | None = None
+                        n_hard = getattr(args, 'n_hard_neg', 10)
+                        if use_hard_negs and n_hard > 0 and ii_layers:
+                            with torch.no_grad():
+                                # Use final item embeddings for ANN similarity
+                                all_item_emb = ii_final.detach()
+                                batch_item_emb = all_item_emb[pos_items]
+                                interaction_mask = build_interaction_mask(
+                                    batch_items=pos_items,
+                                    train_items=data_generator.train_items,
+                                    n_items=self.n_items,
+                                    batch_users=users,
+                                ).to(device)
+                                hard_negs = mine_hard_negatives_faiss(
+                                    query_embs=batch_item_emb,
+                                    all_embs=all_item_emb,
+                                    interaction_mask=interaction_mask,
+                                    n_hard_neg=n_hard,
+                                    pool_k=getattr(args, 'hard_neg_pool_k', 64),
+                                )  # [B, n_hard, d]
+
+                        for h_l, h_lp1 in i_pairs:
+                            q = h_l[pos_items]
+                            k = h_lp1[pos_items]
+
+                            # Adaptive sample weighting from W_ema (item-side only)
+                            dyn_w: torch.Tensor | None = None
+                            if self.w_ema_i is not None:
+                                w_rows = self.w_ema_i.get_batch_weights(
+                                    item_t.cpu(), device=device
+                                )  # [B, n_items]
+                                col_idx = item_t.cpu().long()
+                                if col_idx.max() < w_rows.size(1):
+                                    dyn_w = w_rows[:, col_idx].to(device)  # [B, B]
+                                    if dyn_w.size(0) != q.size(0):
+                                        dyn_w = None  # safety guard
+
+                            i2i_terms.append(
+                                chunked_info_nce_loss(
+                                    q,
+                                    k,
+                                    tau=tau,
+                                    chunk_size=args.info_nce_chunk_size,
+                                    dynamic_weights=dyn_w,
+                                    hard_negatives=hard_negs,
+                                    hard_neg_weight=getattr(args, 'hard_neg_weight', 0.5),
+                                )
+                            )
+                        batch_i2i = (
+                            torch.stack(i2i_terms).mean()
+                            if i2i_terms
+                            else torch.zeros(1, device=device)
+                        )
+
+                        # ── Soft BYOL cross-view alignment via EMA teacher ────────
+                        # Teacher produces stable stop-gradient targets (TEX §4.4 Alg.1 Step 6)
+                        # sg(f_ξ(B^(L))) — the EMA model runs without grad
+                        with torch.no_grad():
+                            (_, _, ii_final_t, uu_final_t, _, _, u_bip_t, i_bip_t) = (
+                                self.ema_model.forward_plus(
+                                    self.UI_mat,
+                                    self.Item_mat,
+                                    self.User_mat,
+                                    checkpoint_threshold=-1,  # no checkpointing in teacher
+                                )
+                            )
+                        batch_aln = soft_byol_alignment(
+                            ii_final, i_bip_t
+                        ) + soft_byol_alignment(uu_final, u_bip_t)
+
+                        # ── Dirichlet energy regularisation (mini-batch) ──────────
+                        item_batch_idx = item_t  # [B_i], already on device
+                        user_batch_idx = torch.tensor(
+                            users, dtype=torch.long, device=device
+                        )  # [B_u]
+                        batch_dir = _sparse_dirichlet_energy_batch(
+                            ii_final, self.Item_mat, item_batch_idx
+                        ) + _sparse_dirichlet_energy_batch(
+                            uu_final, self.User_mat, user_batch_idx
+                        )
+
+                        # ── Rev5.2: Apply CL Warmup Ramp to ALL CL losses ────────
+                        batch_u2u = batch_u2u * ramp_weight
+                        batch_i2i = batch_i2i * ramp_weight
+                        batch_aln = batch_aln * ramp_weight
+                        batch_dir = batch_dir * ramp_weight
+
+                        # ── Rev5.2: 5-task balanced combination ───────────────────
+                        if isinstance(self.balancer, HybridLossBalancer):
+                            batch_loss = self.balancer(
+                                [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir],
+                                epoch=epoch,
+                                shared_params=shared_params,
+                            )
+                        else:
+                            batch_loss = self.balancer(
+                                [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir]
+                            )
+
+                # Back-propagation (AMP-aware)
+                amp_scaler.scale(batch_loss).backward(retain_graph=False)
+                amp_scaler.step(self.optimizer)
+                amp_scaler.update()
 
                 # ── EMA teacher update (Algorithm 1, Step 11: ξ ← β·ξ + (1-β)·θ) ──
                 update_ema_teacher(self.model, self.ema_model, args.ema_momentum)
