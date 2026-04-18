@@ -72,6 +72,12 @@ from utility.parser import parse_args
 from mmhcl_plus.contrast.uncertainty_balancer import UncertaintyLossBalancer
 from mmhcl_plus.contrast.hybrid_balancer import HybridLossBalancer
 
+from mmhcl_plus.ablation import (
+    apply_to_args as _apply_ablation_to_args,
+    available_variants as _available_ablation_variants,
+    get as _get_ablation_variant,
+)
+
 # ── MMHCL+ package (codes/mmhcl_plus/) ────────────────────────────────────────
 from mmhcl_plus.contrast.losses import vicreg_loss, chunked_info_nce_loss
 from mmhcl_plus.contrast.neighbor_pairs import build_neighbor_layer_pairs
@@ -105,10 +111,22 @@ wandb: Any = None
 
 # ---------------------------------------------------------------------------
 # Named function for gradient-checkpointed sparse MM (must be module-level,
-# not a lambda, so that torch.utils.checkpoint can replay it correctly)
+# not a lambda, so that torch.utils.checkpoint can replay it correctly).
+#
+# NOTE (Rev5.2 AMP fix):
+#   torch.sparse.mm on CUDA dispatches to `addmm_sparse_cuda`, which is NOT
+#   implemented for the `Half` (fp16) dtype. When AMP autocast (fp16) is
+#   active, the dense operand `x` is promoted to fp16, which triggers:
+#       NotImplementedError: "addmm_sparse_cuda" not implemented for 'Half'
+#   Fix: disable autocast locally and execute the sparse MM in fp32. The
+#   surrounding autocast region will automatically down-cast later ops that
+#   DO support fp16, so numerical behaviour of the rest of the forward pass
+#   is unchanged while the unsupported kernel is bypassed.
 # ---------------------------------------------------------------------------
 def _hypergraph_step(adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    return torch.sparse.mm(adj, x)
+    with torch.amp.autocast("cuda", enabled=False):
+        adj_f = adj.float() if adj.is_floating_point() and adj.dtype != torch.float32 else adj
+        return torch.sparse.mm(adj_f, x.float())
 
 
 # ===========================================================================
@@ -185,7 +203,7 @@ class MMHCLWithLayers(MMHCL):
                     _hypergraph_step, I2I_mat, ii_emb, use_reentrant=False
                 )
             else:
-                ii_emb = torch.sparse.mm(I2I_mat, ii_emb)
+                ii_emb = _hypergraph_step(I2I_mat, ii_emb)
             ii_layers.append(ii_emb)
         ii_final = ii_emb
 
@@ -198,7 +216,7 @@ class MMHCLWithLayers(MMHCL):
                     _hypergraph_step, U2U_mat, uu_emb, use_reentrant=False
                 )
             else:
-                uu_emb = torch.sparse.mm(U2U_mat, uu_emb)
+                uu_emb = _hypergraph_step(U2U_mat, uu_emb)
             uu_layers.append(uu_emb)
         uu_final = uu_emb
 
@@ -209,7 +227,7 @@ class MMHCLWithLayers(MMHCL):
             )
             all_e: list[torch.Tensor] = [ego]
             for _ in range(args.UI_layers):
-                ego = torch.sparse.mm(UI_mat, ego)
+                ego = _hypergraph_step(UI_mat, ego)
                 all_e.append(ego)
             mean_e = torch.stack(all_e, dim=1).mean(dim=1)
             u_bip, i_bip = torch.split(mean_e, [self.n_users, self.n_items], dim=0)
@@ -225,7 +243,7 @@ class MMHCLWithLayers(MMHCL):
             )
             all_e = [ego]
             for i in range(args.UI_layers):
-                side = torch.sparse.mm(UI_mat, ego)
+                side = _hypergraph_step(UI_mat, ego)
                 sum_e = F.leaky_relu(self.GC_Linear_list[i](side))
                 bi_e = torch.mul(ego, side)
                 bi_e = F.leaky_relu(self.Bi_Linear_list[i](bi_e))
@@ -318,19 +336,52 @@ class MMHCLPlusTrainer:
             out_dim=args.projector_out_dim,
         ).cuda()
 
-        # Hybrid balancer (Rev5.2: 5 tasks — bpr, u2u, i2i, align, dirichlet)
-        use_hybrid = getattr(args, 'use_hybrid_balancer', 1)
-        if use_hybrid:
+        # ── Active task list (Rev5.2 base = 5; +1 for A7_ego_final) ─────
+        self._enable_nlcl: bool = bool(getattr(args, "enable_neighbor_layer_cl", 1))
+        self._enable_dirichlet: bool = bool(getattr(args, "enable_dirichlet", 1))
+        self._enable_soft_byol: bool = bool(getattr(args, "enable_soft_byol_cross", 1))
+        self._enable_ego_final: bool = bool(getattr(args, "enable_ego_final_anchor", 0))
+        self._enable_cl_ramp: bool = bool(getattr(args, "enable_cl_warmup_ramp", 1))
+        self._enable_delayed_faiss: bool = bool(getattr(args, "enable_delayed_faiss", 1))
+        self._g_layers: int = int(getattr(args, "g_layers", 2))
+
+        self._task_names: list[str] = ["bpr"]
+        if self._enable_nlcl:
+            self._task_names += ["u2u", "i2i"]
+        if self._enable_soft_byol:
+            self._task_names += ["align"]
+        if self._enable_dirichlet:
+            self._task_names += ["dir"]
+        if self._enable_ego_final:
+            self._task_names += ["ego_final"]
+        n_tasks: int = len(self._task_names)
+
+        balancer_type: str = str(getattr(args, "balancer_type", "hybrid")).lower()
+        # Backward-compat: --use_hybrid_balancer 0 overrides to uncertainty
+        if not getattr(args, "use_hybrid_balancer", 1):
+            balancer_type = "uncertainty"
+
+        if balancer_type in {"hybrid", "gradnorm", "fixed"}:
             self.balancer = HybridLossBalancer(
-                num_tasks=getattr(args, 'num_tasks', 5),
-                alpha=getattr(args, 'gradnorm_alpha', 1.5),
-                transition_epoch=getattr(args, 'balancer_transition_epoch', 40),
-                blend_epochs=getattr(args, 'balancer_blend_epochs', 20),
+                num_tasks=n_tasks,
+                alpha=getattr(args, "gradnorm_alpha", 1.5),
+                transition_epoch=getattr(args, "balancer_transition_epoch", 40),
+                blend_epochs=getattr(args, "balancer_blend_epochs", 20),
+                mode=balancer_type,
             ).cuda()
+        elif balancer_type == "uncertainty":
+            # Use the dedicated UncertaintyLossBalancer (single-mode).
+            self.balancer = UncertaintyLossBalancer(num_tasks=n_tasks).cuda()
         else:
-            self.balancer = UncertaintyLossBalancer(
-                num_tasks=getattr(args, 'num_tasks', 5),
-            ).cuda()
+            raise ValueError(f"Unknown balancer_type '{balancer_type}'")
+
+        self.logger.logging(
+            f"[Ablation] balancer={balancer_type} n_tasks={n_tasks} "
+            f"tasks={self._task_names} g_layers={self._g_layers} "
+            f"NLCL={self._enable_nlcl} Dir={self._enable_dirichlet} "
+            f"Align={self._enable_soft_byol} EgoFinal={self._enable_ego_final} "
+            f"CLRamp={self._enable_cl_ramp} DelayFAISS={self._enable_delayed_faiss}"
+        )
 
         # Unified optimizer (model + projector + balancer; NOT ema_model)
         self.optimizer: optim.Adam = optim.Adam(
@@ -508,16 +559,25 @@ class MMHCLPlusTrainer:
             )
             in_warmup: bool = epoch < args.warmup_epochs
 
-            # Rev5.2: CL Warmup Ramp (linear 0→1 scaling)
+            # Rev5.2: CL Warmup Ramp (linear 0→1 scaling).
+            # Ablation A4_no_ramp disables the ramp → abrupt 0→1 jump at warmup end.
             cl_ramp_epochs = getattr(args, 'cl_ramp_epochs', 20)
             delay_hard_negs_epoch = getattr(args, 'delay_hard_negs_epoch', 50)
             if in_warmup:
                 ramp_weight = 0.0
+            elif not self._enable_cl_ramp or cl_ramp_epochs <= 0:
+                ramp_weight = 1.0
             else:
-                ramp_weight = min(1.0, (epoch - args.warmup_epochs) / float(max(cl_ramp_epochs, 1)))
+                ramp_weight = min(1.0, (epoch - args.warmup_epochs) / float(cl_ramp_epochs))
 
-            # Rev5.2: Delayed FAISS hard negatives
-            use_hard_negs = (epoch > delay_hard_negs_epoch) and not in_warmup
+            # Rev5.2: Delayed FAISS hard negatives.
+            # Ablation A5_no_delay disables the delay → hard negs from epoch 0.
+            if in_warmup:
+                use_hard_negs = False
+            elif not self._enable_delayed_faiss:
+                use_hard_negs = True
+            else:
+                use_hard_negs = epoch > delay_hard_negs_epoch
 
             # Shared params for GradNorm (Rev5.2 Hybrid Balancer)
             shared_params = self._get_shared_params() if isinstance(self.balancer, HybridLossBalancer) else None
@@ -591,7 +651,7 @@ class MMHCLPlusTrainer:
                             if soft_w_u.size(0) != len(users):
                                 soft_w_u = None  # safety guard
 
-                        u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=2)
+                        u_pairs = build_neighbor_layer_pairs(uu_layers, max_hops=self._g_layers)
                         u2u_terms: list[torch.Tensor] = []
                         for h_l, h_lp1 in u_pairs:
                             z1 = self.projector(h_l[users])
@@ -614,7 +674,7 @@ class MMHCLPlusTrainer:
 
                         # ── i2i: Chunked InfoNCE on adjacent item-hypergraph layers ──
                         # With hard negative mining (Rev5.1)
-                        i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=2)
+                        i_pairs = build_neighbor_layer_pairs(ii_layers, max_hops=self._g_layers)
                         i2i_terms: list[torch.Tensor] = []
                         item_t = torch.tensor(pos_items, dtype=torch.long, device=device)
 
@@ -676,47 +736,98 @@ class MMHCLPlusTrainer:
                         # ── Soft BYOL cross-view alignment via EMA teacher ────────
                         # Teacher produces stable stop-gradient targets (TEX §4.4 Alg.1 Step 6)
                         # sg(f_ξ(B^(L))) — the EMA model runs without grad
-                        with torch.no_grad():
-                            (_, _, ii_final_t, uu_final_t, _, _, u_bip_t, i_bip_t) = (
-                                self.ema_model.forward_plus(
-                                    self.UI_mat,
-                                    self.Item_mat,
-                                    self.User_mat,
-                                    checkpoint_threshold=-1,  # no checkpointing in teacher
+                        if self._enable_soft_byol:
+                            with torch.no_grad():
+                                (_, _, ii_final_t, uu_final_t, _, _, u_bip_t, i_bip_t) = (
+                                    self.ema_model.forward_plus(
+                                        self.UI_mat,
+                                        self.Item_mat,
+                                        self.User_mat,
+                                        checkpoint_threshold=-1,  # no checkpointing in teacher
+                                    )
                                 )
-                            )
-                        batch_aln = soft_byol_alignment(
-                            ii_final, i_bip_t
-                        ) + soft_byol_alignment(uu_final, u_bip_t)
+                            batch_aln = soft_byol_alignment(
+                                ii_final, i_bip_t
+                            ) + soft_byol_alignment(uu_final, u_bip_t)
+                        else:
+                            batch_aln = torch.zeros(1, device=device)
 
                         # ── Dirichlet energy regularisation (mini-batch) ──────────
-                        item_batch_idx = item_t  # [B_i], already on device
-                        user_batch_idx = torch.tensor(
-                            users, dtype=torch.long, device=device
-                        )  # [B_u]
-                        batch_dir = _sparse_dirichlet_energy_batch(
-                            ii_final, self.Item_mat, item_batch_idx
-                        ) + _sparse_dirichlet_energy_batch(
-                            uu_final, self.User_mat, user_batch_idx
-                        )
+                        if self._enable_dirichlet:
+                            item_batch_idx = item_t  # [B_i], already on device
+                            user_batch_idx = torch.tensor(
+                                users, dtype=torch.long, device=device
+                            )  # [B_u]
+                            batch_dir = _sparse_dirichlet_energy_batch(
+                                ii_final, self.Item_mat, item_batch_idx
+                            ) + _sparse_dirichlet_energy_batch(
+                                uu_final, self.User_mat, user_batch_idx
+                            )
+                        else:
+                            batch_dir = torch.zeros(1, device=device)
+
+                        # ── Ego-Final Anchor (A7_ego_final re-enable) ─────────────
+                        # VICReg between layer-0 (ego) and final-layer embeddings.
+                        batch_ego: torch.Tensor | None = None
+                        if self._enable_ego_final and uu_layers and ii_layers:
+                            h_u_ego = uu_layers[0][users]
+                            h_u_fin = uu_final[users]
+                            h_i_ego = ii_layers[0][pos_items]
+                            h_i_fin = ii_final[pos_items]
+                            ego_u = vicreg_loss(
+                                self.projector(h_u_ego),
+                                self.projector(h_u_fin),
+                                sim_weight=getattr(args, "vicreg_sim_weight", 25.0),
+                                var_weight=getattr(args, "vicreg_var_weight", 25.0),
+                                cov_weight=getattr(args, "vicreg_cov_weight", 1.0),
+                            )
+                            ego_i = vicreg_loss(
+                                self.projector(h_i_ego),
+                                self.projector(h_i_fin),
+                                sim_weight=getattr(args, "vicreg_sim_weight", 25.0),
+                                var_weight=getattr(args, "vicreg_var_weight", 25.0),
+                                cov_weight=getattr(args, "vicreg_cov_weight", 1.0),
+                            )
+                            batch_ego = ego_u + ego_i
+
+                        # ── Gate u2u/i2i by the NLCL toggle (A1 ablation) ─────────
+                        if not self._enable_nlcl:
+                            batch_u2u = torch.zeros(1, device=device)
+                            batch_i2i = torch.zeros(1, device=device)
 
                         # ── Rev5.2: Apply CL Warmup Ramp to ALL CL losses ────────
                         batch_u2u = batch_u2u * ramp_weight
                         batch_i2i = batch_i2i * ramp_weight
                         batch_aln = batch_aln * ramp_weight
                         batch_dir = batch_dir * ramp_weight
+                        if batch_ego is not None:
+                            batch_ego = batch_ego * ramp_weight
 
-                        # ── Rev5.2: 5-task balanced combination ───────────────────
+                        # ── Rev5.2: balancer-driven combination (dynamic n_tasks) ─
+                        task_losses: list[torch.Tensor] = [bpr_term]
+                        for name in self._task_names[1:]:
+                            if name == "u2u":
+                                task_losses.append(batch_u2u)
+                            elif name == "i2i":
+                                task_losses.append(batch_i2i)
+                            elif name == "align":
+                                task_losses.append(batch_aln)
+                            elif name == "dir":
+                                task_losses.append(batch_dir)
+                            elif name == "ego_final":
+                                task_losses.append(
+                                    batch_ego if batch_ego is not None
+                                    else torch.zeros(1, device=device)
+                                )
+
                         if isinstance(self.balancer, HybridLossBalancer):
                             batch_loss = self.balancer(
-                                [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir],
+                                task_losses,
                                 epoch=epoch,
                                 shared_params=shared_params,
                             )
                         else:
-                            batch_loss = self.balancer(
-                                [bpr_term, batch_u2u, batch_i2i, batch_aln, batch_dir]
-                            )
+                            batch_loss = self.balancer(task_losses)
 
                 # Back-propagation (AMP-aware)
                 amp_scaler.scale(batch_loss).backward(retain_graph=False)
@@ -1023,6 +1134,21 @@ def train_evaluation_loop(
         import utility.load_data as _ld
 
         _ld.args = args
+
+    # --- Ablation variant override (must happen before any arg is read) ---
+    ablation_name: str = getattr(args, "ablation_variant", "") or ""
+    if ablation_name:
+        if ablation_name not in _available_ablation_variants():
+            raise ValueError(
+                f"Unknown ablation variant '{ablation_name}'. "
+                f"Available: {_available_ablation_variants()}"
+            )
+        variant = _get_ablation_variant(ablation_name)
+        _apply_ablation_to_args(variant, args)
+        print(
+            f"[Ablation] Running variant '{variant.name}' "
+            f"-- {variant.notes}"
+        )
 
     wandb = None
     if args.use_wandb:

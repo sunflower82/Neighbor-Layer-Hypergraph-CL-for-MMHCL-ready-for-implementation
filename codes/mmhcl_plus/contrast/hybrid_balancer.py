@@ -1,17 +1,27 @@
 """
-Hybrid Loss Balancer — Revision 5.2
+Hybrid Loss Balancer --- Revision 5.2 (ablation-aware).
 
-Combines Uncertainty Weighting (Kendall et al., CVPR 2018) for robust early-stage
-initialization with GradNorm (Chen et al., ICML 2018) for precise late-stage
-gradient equalization across 5 core objectives.
+Combines Uncertainty Weighting (Kendall et al., CVPR 2018) for robust
+early-stage initialization with GradNorm (Chen et al., ICML 2018) for
+precise late-stage gradient equalization across the 5 core MMHCL+
+objectives.
 
 Design (Rev5.2 §3.5):
-  Phase 1 (epoch < transition_epoch): Uncertainty Weighting only
-  Phase 2 (epoch >= transition_epoch): GradNorm takes over
-  Smooth linear blend over blend_epochs to avoid discontinuity
+  Phase 1 (epoch < transition_epoch)           : Uncertainty Weighting
+  Phase 2 (epoch >= transition_epoch)          : GradNorm takes over
+  Smooth linear blend over ``blend_epochs`` to avoid discontinuity.
 
-5 tasks: BPR, u2u (VICReg), i2i (InfoNCE), align (Soft BYOL), dirichlet.
-Ego-Final Anchor is eliminated in Rev5.2.
+In Rev5.2 the balancer is additionally required to support the
+C-series ablations from ``mmhcl_plus_ablation_guide_full_translation``:
+
+  * ``mode="hybrid"``      : default, Uncertainty -> GradNorm transition.
+  * ``mode="uncertainty"`` : Uncertainty Weighting only (C1_uncertainty).
+  * ``mode="gradnorm"``    : GradNorm only (C2_gradnorm).
+  * ``mode="fixed"``       : w_k = 1.0 for every task (C3_fixed).
+
+The 5 default tasks are BPR, u2u (VICReg), i2i (InfoNCE), align
+(Soft BYOL), and Dirichlet.  Ego-Final is re-introduced as a 6th task
+only for the A7_ego_final ablation variant.
 """
 
 from __future__ import annotations
@@ -20,20 +30,27 @@ import torch
 import torch.nn as nn
 
 
+_VALID_MODES: tuple[str, ...] = ("hybrid", "uncertainty", "gradnorm", "fixed")
+
+
 class HybridLossBalancer(nn.Module):
-    """
-    Hybrid Loss Balancer: Uncertainty Weighting → GradNorm transition.
+    """Ablation-aware loss balancer for MMHCL+.
 
     Parameters
     ----------
     num_tasks : int
-        Number of loss components (default: 5 for Rev5.2).
+        Number of loss components.  Default 5 for Rev5.2 (``BPR, u2u,
+        i2i, align, dirichlet``); 6 when the A7 ego-final anchor is
+        re-enabled; smaller values for ablations that remove a branch.
     alpha : float
-        GradNorm restoring force exponent (default: 1.5).
+        GradNorm restoring-force exponent (default 1.5).
     transition_epoch : int
-        Epoch at which GradNorm begins to activate (default: 40).
+        Epoch at which GradNorm starts to take over (hybrid mode only).
     blend_epochs : int
-        Number of epochs to linearly blend from Uncertainty to GradNorm (default: 20).
+        Number of epochs over which the uncertainty -> gradnorm blend
+        is interpolated linearly.
+    mode : str
+        One of ``{"hybrid", "uncertainty", "gradnorm", "fixed"}``.
     """
 
     def __init__(
@@ -42,27 +59,39 @@ class HybridLossBalancer(nn.Module):
         alpha: float = 1.5,
         transition_epoch: int = 40,
         blend_epochs: int = 20,
+        mode: str = "hybrid",
     ) -> None:
         super().__init__()
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"Invalid balancer mode '{mode}'. Expected one of {_VALID_MODES}."
+            )
         self.num_tasks = num_tasks
         self.alpha = alpha
         self.transition_epoch = transition_epoch
         self.blend_epochs = blend_epochs
+        self.mode = mode
 
-        # Uncertainty Weighting parameters
+        # Uncertainty Weighting parameters (Kendall et al., 2018)
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
 
-        # GradNorm parameters
+        # GradNorm parameters (Chen et al., 2018)
         self.task_weights = nn.Parameter(torch.ones(num_tasks))
         self.register_buffer("l0", torch.zeros(num_tasks))
         self.register_buffer("l0_initialized", torch.zeros(1, dtype=torch.bool))
 
+    # ------------------------------------------------------------------
+    #  Sub-objectives
+    # ------------------------------------------------------------------
     def _uncertainty_forward(self, losses: list[torch.Tensor]) -> torch.Tensor:
         total = torch.zeros(1, device=losses[0].device)
         for i, loss in enumerate(losses):
             precision = torch.exp(-self.log_vars[i])
             total = total + 0.5 * precision * loss + 0.5 * self.log_vars[i]
         return total.squeeze()
+
+    def _fixed_forward(self, losses: list[torch.Tensor]) -> torch.Tensor:
+        return torch.stack(losses).sum()
 
     def _gradnorm_forward(
         self,
@@ -105,33 +134,47 @@ class HybridLossBalancer(nn.Module):
 
         return total + L_gn
 
+    # ------------------------------------------------------------------
+    #  Public API
+    # ------------------------------------------------------------------
     def forward(
         self,
         losses: list[torch.Tensor],
         epoch: int = 0,
         shared_params: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """Aggregate ``losses`` according to the configured ``mode``."""
+        if self.mode == "fixed":
+            return self._fixed_forward(losses)
+        if self.mode == "uncertainty":
+            return self._uncertainty_forward(losses)
+        if self.mode == "gradnorm":
+            return self._gradnorm_forward(losses, shared_params)
+
+        # hybrid: uncertainty -> gradnorm with a linear blend
         if epoch < self.transition_epoch:
             return self._uncertainty_forward(losses)
-        elif epoch < self.transition_epoch + self.blend_epochs:
+        if epoch < self.transition_epoch + self.blend_epochs:
             blend_ratio = (epoch - self.transition_epoch) / float(self.blend_epochs)
             L_unc = self._uncertainty_forward(losses)
             L_gn = self._gradnorm_forward(losses, shared_params)
             return (1.0 - blend_ratio) * L_unc + blend_ratio * L_gn
-        else:
-            return self._gradnorm_forward(losses, shared_params)
+        return self._gradnorm_forward(losses, shared_params)
 
     def get_weights(self) -> dict[str, torch.Tensor]:
+        """Return current effective task weights (for W&B logging)."""
         unc_w = torch.exp(-self.log_vars).detach()
         gn_w = self.task_weights.clamp(min=1e-3).detach()
         gn_w = gn_w * self.num_tasks / gn_w.sum()
         return {"uncertainty": unc_w, "gradnorm": gn_w}
 
     def get_phase(self, epoch: int) -> str:
+        """Return a short human-readable label for the current phase."""
+        if self.mode != "hybrid":
+            return self.mode
         if epoch < self.transition_epoch:
             return "uncertainty"
-        elif epoch < self.transition_epoch + self.blend_epochs:
+        if epoch < self.transition_epoch + self.blend_epochs:
             ratio = (epoch - self.transition_epoch) / float(self.blend_epochs)
             return f"blend({ratio:.2f})"
-        else:
-            return "gradnorm"
+        return "gradnorm"

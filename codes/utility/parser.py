@@ -606,4 +606,78 @@ def parse_args() -> argparse.Namespace:
         help="Epochs to blend Uncertainty->GradNorm.",
     )
 
+    # =====================================================================
+    #  MMHCL+ Rev5.2 Ablation Study (see mmhcl_plus/ablation/ablation_config.py)
+    # =====================================================================
+    parser.add_argument(
+        "--ablation_variant",
+        type=str,
+        default="",
+        help="Named variant from mmhcl_plus.ablation.REGISTRY "
+        '(e.g. "A1_no_nlcl"). When provided, it overrides the '
+        "individual ablation toggles below. Leave empty to use the "
+        "flags as-is.",
+    )
+    parser.add_argument(
+        "--balancer_type",
+        type=str,
+        default="hybrid",
+        choices=["hybrid", "uncertainty", "gradnorm", "fixed"],
+        help="Mode for HybridLossBalancer. The C-series ablations "
+        "(C1/C2/C3) switch this to uncertainty / gradnorm / fixed.",
+    )
+    parser.add_argument(
+        "--g_layers",
+        type=int,
+        default=2,
+        help="Neighbor-layer depth (``max_hops``) used when building "
+        "u2u / i2i contrastive pairs. Rev5.2 default is 2 (DPI-safe); "
+        "the B-series sweeps {1, 2, 3}.",
+    )
+    parser.add_argument(
+        "--enable_neighbor_layer_cl",
+        type=int,
+        default=1,
+        help="1 = keep the u2u (VICReg) and i2i (Chunked InfoNCE) "
+        "terms, 0 = zero them out (A1_no_nlcl ablation).",
+    )
+    parser.add_argument(
+        "--enable_cl_warmup_ramp",
+        type=int,
+        default=1,
+        help="1 = linear 0->1 ramp for the CL losses over "
+        "``cl_ramp_epochs`` after warmup, 0 = abrupt activation "
+        "(A4_no_ramp ablation).",
+    )
+    parser.add_argument(
+        "--enable_delayed_faiss",
+        type=int,
+        default=1,
+        help="1 = delay FAISS hard negatives until "
+        "``delay_hard_negs_epoch``, 0 = use hard negatives from "
+        "epoch 0 (A5_no_delay ablation).",
+    )
+    parser.add_argument(
+        "--enable_dirichlet",
+        type=int,
+        default=1,
+        help="1 = keep Hutchinson Dirichlet energy term, 0 = zero "
+        "it out (A6_no_dirichlet ablation).",
+    )
+    parser.add_argument(
+        "--enable_soft_byol_cross",
+        type=int,
+        default=1,
+        help="1 = keep Soft BYOL cross-branch alignment term, "
+        "0 = zero it out (A8_no_cross ablation).",
+    )
+    parser.add_argument(
+        "--enable_ego_final_anchor",
+        type=int,
+        default=0,
+        help="1 = re-enable the Rev5.1 ego-final VICReg anchor "
+        "(A7_ego_final ablation, 6 tasks). 0 = disabled as in "
+        "Rev5.2.",
+    )
+
     return parser.parse_args()
