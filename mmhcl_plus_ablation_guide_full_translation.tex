@@ -199,7 +199,7 @@ class AblationVariant:
     g_layers: int = 2
     svd_top_k: int = 10
     balancer_type: str = "hybrid"
-    balancer_switch_epoch: int = 30
+    balancer_switch_epoch: int = 40
     warmup_epochs: int = 15
     n_tasks: int = 5
     notes: str = ""
@@ -331,27 +331,36 @@ torch.backends.cudnn.deterministic = True
 \end{lstlisting}
 
 \subsection{Cell [Ablation-2]: patch the model and training pipeline}
+
+\textbf{Important.} Do \emph{not} patch individual fields manually, otherwise
+toggles such as \texttt{enable\_neighbor\_layer\_cl}, \texttt{enable\_dirichlet},
+\texttt{enable\_soft\_byol\_cross}, \texttt{enable\_ego\_final\_anchor},
+\texttt{balancer\_type}, and \texttt{balancer\_transition\_epoch} will silently
+stay at their defaults and variants A1 / A6 / A8 / C1--C3 will not actually
+differ from A0. Use the centralized \texttt{apply\_to\_args()} helper, which is
+the single source of truth for the field-to-argument mapping:
+
 \begin{lstlisting}[language=Python]
-args.g_layers              = cfg.g_layers
-args.warmup_epochs         = cfg.warmup_epochs
-args.delay_hard_negs_epoch = cfg.delay_hard_negs_epoch if cfg.enable_delayed_faiss else 0
-args.vicreg_hidden_dim     = cfg.vicreg_hidden_dim
-args.vicreg_projector_dim  = cfg.vicreg_projector_dim
-args.enable_svd_spectral   = cfg.enable_svd_spectral
-args.svd_top_k             = cfg.svd_top_k
+from mmhcl_plus.ablation import apply_to_args
+
+apply_to_args(cfg, args)  # patches all 17 fields in one call
 
 projector = ExpandedProjector(
     input_dim=64,
-    hidden_dim=cfg.vicreg_hidden_dim,
-    output_dim=cfg.vicreg_projector_dim
+    hidden_dim=args.projector_hidden_dim,
+    output_dim=args.projector_out_dim,
 ).cuda()
 
 hybrid_balancer = HybridLossBalancer(
-    num_tasks=cfg.n_tasks,
-    mode=cfg.balancer_type,
-    switch_epoch=cfg.balancer_switch_epoch
+    num_tasks=args.num_tasks,
+    mode=args.balancer_type,
+    switch_epoch=args.balancer_transition_epoch,
 ).cuda()
 \end{lstlisting}
+
+When driving the sweep via \texttt{--ablation\_variant} (e.g.\ through the
+notebook's Cell~20 or \texttt{codes/run\_ablation.py}), this patch happens
+automatically inside \texttt{main\_mmhcl\_plus.py}; no manual cell is required.
 
 \subsection{Execution convention}
 A single variant can be launched from the command line using:

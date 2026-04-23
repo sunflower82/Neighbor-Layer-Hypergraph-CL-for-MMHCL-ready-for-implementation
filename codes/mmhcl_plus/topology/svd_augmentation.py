@@ -1,5 +1,5 @@
 """
-SVD-Based Spectral Augmentation for Hypergraphs --- Revision 5.1
+SVD-Based Spectral Augmentation for Hypergraphs --- Revision 5.2
 
 TEX Rev5.1 Section 2.2, Corollary 2.1:
     By performing SVD on the incidence matrix H and truncating the top-K
@@ -7,6 +7,11 @@ TEX Rev5.1 Section 2.2, Corollary 2.1:
     Contrasting embeddings derived from H_tilde against those from the
     original H forces the GNN to capture true collaborative signals
     independent of macroscopic popularity bridges.
+
+Rev5.2 update: svd_filter_incidence now uses torch.svd_lowrank for
+large datasets (n_items > 8000, e.g. Amazon Clothing with 23033 items).
+This avoids the O(n^3) full numpy SVD and the associated 20+ GB RAM
+requirement, reducing peak memory to ~n*m*4 bytes (float32 dense).
 """
 
 from __future__ import annotations
@@ -14,6 +19,9 @@ from __future__ import annotations
 import torch
 import scipy.sparse as sp
 import numpy as np
+
+# Threshold: use efficient lowrank SVD when n_rows exceeds this value.
+_LOWRANK_THRESHOLD = 8000
 
 
 def svd_filter_incidence(
@@ -27,34 +35,53 @@ def svd_filter_incidence(
     spectral directions) to produce a filtered H_tilde that emphasises
     long-tail collaborative signals.
 
+    For small datasets (n_rows <= _LOWRANK_THRESHOLD), uses the exact
+    full numpy SVD.  For large datasets (e.g. Amazon Clothing with 23033
+    items), uses torch.svd_lowrank which computes only the top-K+extra
+    singular components, dramatically reducing RAM from ~20 GB to ~4 GB.
+
     Args:
         H:     Incidence matrix (n_nodes x n_edges), sparse or dense.
         top_k: Number of top singular values to remove.
 
     Returns:
-        H_tilde: Filtered incidence matrix as a dense torch.Tensor.
+        H_tilde: Filtered incidence matrix as a dense torch.Tensor (CPU).
     """
+    # Convert to a float32 CPU dense tensor first
     if sp.issparse(H):
-        H_dense = H.toarray()
+        H_dense = torch.from_numpy(H.toarray().astype(np.float32))
     elif isinstance(H, torch.Tensor):
-        H_dense = H.to_dense().detach().cpu().numpy()
+        H_dense = H.to_dense().detach().cpu().float()
     else:
-        H_dense = np.asarray(H)
+        H_dense = torch.from_numpy(np.asarray(H, dtype=np.float32))
 
-    H_dense = H_dense.astype(np.float32)
+    n_rows, n_cols = H_dense.shape
+    k = min(top_k, min(n_rows, n_cols))
 
-    # Full SVD (for small-to-medium scale hypergraphs)
-    U, S, Vt = np.linalg.svd(H_dense, full_matrices=False)
-
-    # Zero out the top-K singular values (popularity-dominated directions)
-    k = min(top_k, len(S))
-    S_filtered = S.copy()
-    S_filtered[:k] = 0.0
-
-    # Reconstruct the filtered incidence matrix
-    H_filtered = U @ np.diag(S_filtered) @ Vt
-
-    return torch.from_numpy(H_filtered).float()
+    if n_rows > _LOWRANK_THRESHOLD:
+        # --- Efficient low-rank path (large datasets like Clothing) ----------
+        # torch.svd_lowrank computes only the top-q singular components, using
+        # a randomised algorithm that is O(n*q*d) instead of O(n^2*d).
+        # Use GPU if available to accelerate the randomised SVD.
+        q = min(k + 10, min(n_rows, n_cols))  # slight oversampling for accuracy
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        H_gpu = H_dense.to(device)
+        U_k, S_k, V_k = torch.svd_lowrank(H_gpu, q=q)
+        # Keep only top-k components
+        U_k = U_k[:, :k]   # (n_rows, k)
+        S_k = S_k[:k]       # (k,)
+        V_k = V_k[:, :k]    # (n_cols, k)
+        # H_filtered = H - top_k_reconstruction (remove popularity directions)
+        H_filtered = H_gpu - (U_k * S_k.unsqueeze(0)) @ V_k.t()
+        return H_filtered.cpu()
+    else:
+        # --- Exact full SVD path (small datasets like Baby/Sports) -----------
+        H_np = H_dense.numpy()
+        U, S, Vt = np.linalg.svd(H_np, full_matrices=False)
+        S_filtered = S.copy()
+        S_filtered[:k] = 0.0
+        H_filtered = U @ np.diag(S_filtered) @ Vt
+        return torch.from_numpy(H_filtered).float()
 
 
 def svd_filter_sparse(

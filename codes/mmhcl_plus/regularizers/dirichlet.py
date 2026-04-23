@@ -25,6 +25,26 @@ from __future__ import annotations
 import torch
 
 
+def _safe_sparse_mm(adj: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """AMP-safe sparse matmul.
+
+    `torch.sparse.mm` dispatches to `addmm_sparse_cuda` on CUDA, which is
+    not implemented for fp16 (Half). Under `torch.amp.autocast("cuda")`
+    the dense operand gets promoted to Half and the call crashes with
+    ``NotImplementedError: "addmm_sparse_cuda" not implemented for 'Half'``.
+
+    Locally disable autocast and execute the matmul in fp32.  The caller's
+    autocast region remains in effect for downstream ops.
+    """
+    with torch.amp.autocast("cuda", enabled=False):
+        adj_f = (
+            adj.float()
+            if adj.is_floating_point() and adj.dtype != torch.float32
+            else adj
+        )
+        return torch.sparse.mm(adj_f, x.float())
+
+
 def dirichlet_energy_batch(
     E_batch: torch.Tensor,
     lap_block: torch.Tensor,
@@ -45,7 +65,7 @@ def dirichlet_energy_batch(
         lap_block = lap_block.to(E_batch.device)
 
     if lap_block.is_sparse:
-        prod = torch.sparse.mm(lap_block, E_batch)  # [B, d]
+        prod = _safe_sparse_mm(lap_block, E_batch)  # [B, d]
     else:
         prod = lap_block @ E_batch  # [B, d]
 
@@ -94,7 +114,7 @@ def sparse_dirichlet_energy(emb: torch.Tensor, adj: torch.Tensor) -> torch.Tenso
         Scalar Dirichlet energy.
     """
     n = emb.size(0)
-    adj_emb = torch.sparse.mm(adj, emb)
+    adj_emb = _safe_sparse_mm(adj, emb)
     return ((emb * emb).sum() - (emb * adj_emb).sum()) / n
 
 
@@ -121,6 +141,6 @@ def sparse_dirichlet_energy_batch(
         Scalar Dirichlet energy for the mini-batch.
     """
     E_batch = emb[batch_idx]
-    adj_emb_batch = torch.sparse.mm(adj, emb)[batch_idx]
+    adj_emb_batch = _safe_sparse_mm(adj, emb)[batch_idx]
     n_batch = batch_idx.size(0)
     return ((E_batch * E_batch).sum() - (E_batch * adj_emb_batch).sum()) / n_batch

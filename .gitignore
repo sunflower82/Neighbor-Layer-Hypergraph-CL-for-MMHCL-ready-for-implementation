@@ -24,7 +24,9 @@ data/baby/5-core/User_mat_rw.pth
 data/archive/
 data/elec/
 data/sports/
-data/Clothing/
+# Exclude large Clothing binaries but allow small JSON splits
+data/Clothing/**/*.npy
+data/Clothing/**/*.pth
 data/Trained-Model*/
 data/BM3*/
 data/drive-download*/
