@@ -77,7 +77,7 @@ _FALLBACK_PATTERNS: dict[str, re.Pattern[str]] = {
 
 def parse_cli() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--dataset", default="Baby")
+    p.add_argument("--dataset", default="Clothing")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--epochs", type=int, default=250,
                    help="Max epochs per run (early stopping may cut it shorter).")
