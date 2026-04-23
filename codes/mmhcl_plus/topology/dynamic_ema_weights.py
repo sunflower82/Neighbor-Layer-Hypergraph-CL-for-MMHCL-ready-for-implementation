@@ -69,11 +69,16 @@ def neighbor_sets_from_raw_features(
     if ann_backend != "faiss" or not raw_features_list:
         return None
 
-    feats_sum: torch.Tensor | None = None
-    for feats in raw_features_list:
-        n = F.normalize(feats.float().cpu(), p=2, dim=-1)
-        feats_sum = n if feats_sum is None else feats_sum + n
-    emb = feats_sum / max(len(raw_features_list), 1)
+    # Normalize each modality independently, then concatenate along the feature
+    # dimension.  Summation (the previous approach) requires all modalities to
+    # share the same feature dimension, which is NOT guaranteed: e.g. Clothing
+    # has image_feat (d=4096) and text_feat (d=384).  Concatenation + re-norm
+    # produces a single joint embedding that works regardless of per-modality dim.
+    normed_list: list[torch.Tensor] = [
+        F.normalize(feats.float().cpu(), p=2, dim=-1)
+        for feats in raw_features_list
+    ]
+    emb = F.normalize(torch.cat(normed_list, dim=1), p=2, dim=-1)
     n_nodes, dim = emb.shape
     if n_nodes <= 1 or ann_k <= 0:
         return None
