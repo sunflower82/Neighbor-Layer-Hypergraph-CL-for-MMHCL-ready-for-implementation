@@ -36,35 +36,70 @@ class HardNegativeMiner:
     Falls back to PyTorch GPU brute-force when faiss-gpu is not installed
     (common on Windows).  For small item sets (< 50k), the PyTorch path
     is already competitive.
+
+    Acceleration Guide §2:
+      The FAISS GPU index is allocated **once** in ``__init__`` via
+      ``GpuIndexFlatIP`` with ``useFloat16=True`` (halves VRAM, accelerates
+      inner-product search). Subsequent ``build()`` calls only reset and
+      re-add embeddings, avoiding the expensive CPU→GPU transfer that the
+      old ``index_cpu_to_gpu`` path incurred every step.
     """
 
     def __init__(self, dim: int, device: int = 0) -> None:
         self.dim = dim
         self.device = device
         self._use_faiss = _FAISS_GPU_AVAILABLE
+        self._index: "faiss.Index | None" = None
+        self._all_norm: torch.Tensor | None = None  # PyTorch fallback cache
         if self._use_faiss:
             self._res = faiss.StandardGpuResources()
-            self._index: faiss.Index | None = None
+            try:
+                cfg = faiss.GpuIndexFlatConfig()
+                cfg.useFloat16 = True  # Acceleration Guide §2
+                cfg.device = self.device
+                self._index = faiss.GpuIndexFlatIP(self._res, self.dim, cfg)
+            except Exception:
+                # Older faiss-gpu builds: fall back to CPU→GPU cloner
+                cpu_ip = faiss.IndexFlatIP(self.dim)
+                try:
+                    co = faiss.GpuClonerOptions()
+                    co.useFloat16 = True
+                    self._index = faiss.index_cpu_to_gpu(
+                        self._res, self.device, cpu_ip, co
+                    )
+                except Exception:
+                    self._use_faiss = False  # disable FAISS path entirely
+                    self._index = None
 
     # ── Build / rebuild index each epoch ──────────────────────────────────
     def build(self, embeddings: torch.Tensor) -> None:
-        """(Re-)build the ANN index from item embeddings."""
-        if not self._use_faiss:
-            # PyTorch path: just cache normalised embeddings
-            self._all_norm = F.normalize(embeddings.detach().contiguous().float(), p=2, dim=-1)
+        """Reset the persistent index and add current embeddings.
+
+        The index object itself is allocated once in ``__init__`` — this
+        method only clears its contents and streams the new vectors to
+        GPU memory via ``.add()``, keeping the data resident on-device.
+        """
+        emb = F.normalize(
+            embeddings.detach().contiguous().float(), p=2, dim=-1
+        )
+        if not self._use_faiss or self._index is None:
+            # PyTorch fallback: cache the normalized matrix on the same device
+            self._all_norm = emb
             return
-        cpu_index = faiss.IndexFlatIP(self.dim)
-        self._index = faiss.index_cpu_to_gpu(self._res, self.device, cpu_index)
-        emb = F.normalize(embeddings.detach().contiguous().float(), p=2, dim=-1)
+        self._index.reset()
         self._index.add(emb)
 
     # ── Batch search ──────────────────────────────────────────────────────
-    def search(self, queries: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def search(
+        self, queries: torch.Tensor, k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (scores [B,k], indices [B,k])."""
         q = F.normalize(queries.detach().contiguous().float(), p=2, dim=-1)
-        if self._use_faiss:
+        if self._use_faiss and self._index is not None:
+            # faiss.contrib.torch_utils enables direct torch.Tensor search
             return self._index.search(q, k)
         # PyTorch fallback
+        assert self._all_norm is not None, "build() must be called first"
         sim = q @ self._all_norm.T
         return sim.topk(k, dim=-1)
 
@@ -97,8 +132,29 @@ def mine_hard_negatives_faiss(
         hard_negatives: [B, n_hard_neg, d] hard negative embeddings.
     """
     B, d = query_embs.shape
+    N = all_embs.size(0)
     device = query_embs.device
 
+    # ── Fast path (Acceleration Guide §2) ────────────────────────────────
+    # When a persistent FAISS-GPU miner is supplied AND there is no
+    # interaction mask to enforce, search directly in the index. The index
+    # keeps embeddings resident on GPU in fp16, avoiding the temporary
+    # [B, N] logits matrix and skipping a full torch.topk.
+    # NOTE: FAISS's IndexFlatIP returns top results sorted by score only;
+    # when ``interaction_mask`` is active we still need the logits matrix
+    # to apply the mask, so we fall back to the torch path below.
+    use_miner = (
+        miner is not None
+        and getattr(miner, "_use_faiss", False)
+        and interaction_mask is None
+    )
+    if use_miner:
+        miner.build(all_embs)
+        _, topk_indices = miner.search(query_embs, min(pool_k, N))
+        hard_neg_indices = topk_indices[:, :n_hard_neg].to(device)
+        return all_embs[hard_neg_indices]
+
+    # ── Mask-aware fallback (and default torch path) ─────────────────────
     # L2 normalize for cosine similarity search
     q_norm = F.normalize(query_embs.detach(), p=2, dim=-1)
     all_norm = F.normalize(all_embs.detach(), p=2, dim=-1)

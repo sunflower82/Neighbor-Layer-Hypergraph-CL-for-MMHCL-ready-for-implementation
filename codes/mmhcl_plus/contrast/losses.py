@@ -71,20 +71,29 @@ def vicreg_loss(
     else:
         repr_loss = F.mse_loss(z1, z2)
 
-    # -- 2. Variance term: push std of each dimension above 1 --
-    z1 = z1 - z1.mean(dim=0)
-    z2 = z2 - z2.mean(dim=0)
+    # Acceleration Guide §3 — VICReg variance+covariance in fp32.
+    # The D×D covariance matrix has ~D²=16M terms for D=4096; the sum of
+    # squared off-diagonals can easily exceed float16's max value (~65504).
+    # Disabling autocast + casting to float32 guarantees numerical safety
+    # regardless of whether the caller is using fp16, bf16, or no AMP.
+    with torch.amp.autocast("cuda", enabled=False):
+        z1_f = z1.float()
+        z2_f = z2.float()
 
-    std_loss = torch.mean(F.relu(1.0 - torch.sqrt(z1.var(dim=0) + 1e-4))) + \
-               torch.mean(F.relu(1.0 - torch.sqrt(z2.var(dim=0) + 1e-4)))
+        # -- 2. Variance term: push std of each dimension above 1 --
+        z1_f = z1_f - z1_f.mean(dim=0)
+        z2_f = z2_f - z2_f.mean(dim=0)
 
-    # -- 3. Covariance term: decorrelate off-diagonal entries --
-    N, D = z1.size()
-    cov_z1 = (z1.T @ z1) / (N - 1)
-    cov_z2 = (z2.T @ z2) / (N - 1)
+        std_loss = torch.mean(F.relu(1.0 - torch.sqrt(z1_f.var(dim=0) + 1e-4))) + \
+                   torch.mean(F.relu(1.0 - torch.sqrt(z2_f.var(dim=0) + 1e-4)))
 
-    cov_loss = off_diagonal(cov_z1).pow_(2).sum().div(D) + \
-               off_diagonal(cov_z2).pow_(2).sum().div(D)
+        # -- 3. Covariance term: decorrelate off-diagonal entries --
+        N, D = z1_f.size()
+        cov_z1 = (z1_f.T @ z1_f) / (N - 1)
+        cov_z2 = (z2_f.T @ z2_f) / (N - 1)
+
+        cov_loss = off_diagonal(cov_z1).pow_(2).sum().div(D) + \
+                   off_diagonal(cov_z2).pow_(2).sum().div(D)
 
     return sim_weight * repr_loss + var_weight * std_loss + cov_weight * cov_loss
 

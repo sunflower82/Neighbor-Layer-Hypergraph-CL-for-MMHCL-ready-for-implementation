@@ -320,8 +320,13 @@ class MMHCLPlusTrainer:
             p.requires_grad_(False)
 
         # ── Rev5.2-OPT: torch.compile wrapper (preserves architecture) ────
+        # Acceleration Guide §1: `mode="reduce-overhead"` enables CUDA graphs
+        # and yields an additional ~5-10% speedup over `mode="default"` for
+        # the static-shape GNN forward pass (forward_plus receives the fixed
+        # UI/User/Item adjacency matrices on every call — no shape variance).
+        # Override via MMHCL_COMPILE_MODE=default if recompilation is observed.
         USE_COMPILE = os.environ.get("MMHCL_COMPILE", "1") == "1"
-        COMPILE_MODE = os.environ.get("MMHCL_COMPILE_MODE", "default")
+        COMPILE_MODE = os.environ.get("MMHCL_COMPILE_MODE", "reduce-overhead")
         if USE_COMPILE and hasattr(torch, "compile"):
             try:
                 self.model = torch.compile(self.model, mode=COMPILE_MODE, dynamic=False)
@@ -543,10 +548,42 @@ class MMHCLPlusTrainer:
             self.logger.logging("W&B run initialized: %s" % wandb.run.name)
 
         # ── AMP: GradScaler for mixed-precision training ─────────────────────
+        # Acceleration Guide §3: bfloat16 is the safer default on RTX 5090 (Ada
+        # Lovelace / Blackwell). It has the same dynamic range as float32, so
+        # VICReg's [D, D] covariance-sum (D=4096 → ~16M terms) cannot overflow.
+        # float16 is retained as an opt-in via MMHCL_AMP_DTYPE=float16 for
+        # legacy runs. bfloat16 does NOT require a GradScaler.
         USE_AMP = os.environ.get("MMHCL_AMP", "1") == "1"
-        amp_scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+        AMP_DTYPE_STR = os.environ.get("MMHCL_AMP_DTYPE", "bfloat16").lower()
+        if AMP_DTYPE_STR in ("bf16", "bfloat16"):
+            amp_dtype = torch.bfloat16
+            amp_scaler = torch.amp.GradScaler("cuda", enabled=False)  # no-op for bf16
+        else:
+            amp_dtype = torch.float16
+            amp_scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
         if USE_AMP:
-            self.logger.logging("[Rev5.2-OPT] AMP enabled (float16 autocast)")
+            self.logger.logging(
+                f"[Rev5.2-OPT] AMP enabled (dtype={amp_dtype}, "
+                f"scaler={'on' if amp_scaler.is_enabled() else 'off'})"
+            )
+
+        # ── Rev5.2-OPT: persistent HardNegativeMiner (Acceleration Guide §2) ─
+        # Create the FAISS-GPU index once (fp16 storage, GpuIndexFlatIP) and
+        # reuse it every epoch via .reset() + .add(). This avoids re-allocating
+        # the CPU→GPU index on every call and halves the FAISS VRAM footprint.
+        self._hard_neg_miner: HardNegativeMiner | None = None
+        try:
+            self._hard_neg_miner = HardNegativeMiner(
+                dim=self.emb_dim, device=int(getattr(args, "gpu_id", 0))
+            )
+            self.logger.logging(
+                f"[Rev5.2-OPT] Persistent HardNegativeMiner ready "
+                f"(faiss_gpu={self._hard_neg_miner._use_faiss})"
+            )
+        except Exception as _miner_err:
+            self.logger.logging(
+                f"[Rev5.2-OPT] HardNegativeMiner init skipped: {_miner_err}"
+            )
 
         # ── Epoch loop ──────────────────────────────────────────────────────
         for epoch in range(args.epoch):
@@ -601,7 +638,8 @@ class MMHCLPlusTrainer:
                 users, pos_items, neg_items = data_generator.sample()
 
                 # ── AMP autocast: wraps forward + loss (NOT backward) ────────
-                with torch.amp.autocast("cuda", enabled=USE_AMP):
+                # Acceleration Guide §3 — dtype configurable via MMHCL_AMP_DTYPE.
+                with torch.amp.autocast("cuda", enabled=USE_AMP, dtype=amp_dtype):
 
                     # Forward pass — student (online) network with checkpointing
                     (
@@ -698,6 +736,7 @@ class MMHCLPlusTrainer:
                                     interaction_mask=interaction_mask,
                                     n_hard_neg=n_hard,
                                     pool_k=getattr(args, 'hard_neg_pool_k', 64),
+                                    miner=self._hard_neg_miner,
                                 )  # [B, n_hard, d]
 
                         for h_l, h_lp1 in i_pairs:
