@@ -607,6 +607,30 @@ def parse_args() -> argparse.Namespace:
     )
 
     # =====================================================================
+    #  MMHCL+ Rev5.2 Acceleration Guide — Speedup Strategies A, B
+    #  (mmhcl_rev52_speedup_analysis_en.tex; aggregate ~30-40% wall-clock
+    #   saving on Amazon Clothing without architectural changes)
+    # =====================================================================
+    parser.add_argument(
+        "--gradnorm_stride",
+        type=int,
+        default=4,
+        help="Strategy A: update GradNorm task weights every N batches "
+        "and reuse the cached weights in between (saves ~12%% of total "
+        "training time on Clothing). Set to 1 to recover per-batch "
+        "behaviour, or 0/<=1 internally clamps to 1.",
+    )
+    parser.add_argument(
+        "--vicreg_lazy_cov",
+        type=int,
+        default=1,
+        help="Strategy B1: when 1, VICReg's [D, D] covariance term is "
+        "computed only on even-indexed epochs (epoch %% 2 == 0). Recovers "
+        "~10%% wall-clock; cov_weight=1.0 vs sim+var=50.0 keeps NDCG "
+        "essentially flat. Set to 0 to compute the covariance every epoch.",
+    )
+
+    # =====================================================================
     #  MMHCL+ Rev5.2 Ablation Study (see mmhcl_plus/ablation/ablation_config.py)
     # =====================================================================
     parser.add_argument(

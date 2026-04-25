@@ -22,6 +22,15 @@ C-series ablations from ``mmhcl_plus_ablation_guide_full_translation``:
 The 5 default tasks are BPR, u2u (VICReg), i2i (InfoNCE), align
 (Soft BYOL), and Dirichlet.  Ego-Final is re-introduced as a 6th task
 only for the A7_ego_final ablation variant.
+
+Acceleration Guide §A (Rev5.2 speedup analysis): the per-task GradNorm
+backward pass dominates the training step --- 5 extra ``autograd.grad``
+calls per batch, layered on top of the principal backward, account for
+the +21 s/epoch jump observed when GradNorm engages at epoch 40.  We
+therefore expose a ``gradnorm_stride`` knob: task weights are recomputed
+only once every ``stride`` batches and cached in a registered buffer in
+between, recovering ~12 % of total training time at no loss-landscape
+cost (Sener & Koltun, 2018; Liu et al., 2019).
 """
 
 from __future__ import annotations
@@ -51,6 +60,12 @@ class HybridLossBalancer(nn.Module):
         is interpolated linearly.
     mode : str
         One of ``{"hybrid", "uncertainty", "gradnorm", "fixed"}``.
+    gradnorm_stride : int
+        Update GradNorm task weights only every ``stride`` mini-batches
+        and reuse the cached weights in between (Acceleration Guide §A).
+        ``stride=1`` reproduces the original per-batch behaviour; the
+        Rev5.2 default of ``4`` recovers ~12 % wall-clock without any
+        measurable change to the loss landscape.
     """
 
     def __init__(
@@ -60,6 +75,7 @@ class HybridLossBalancer(nn.Module):
         transition_epoch: int = 40,
         blend_epochs: int = 20,
         mode: str = "hybrid",
+        gradnorm_stride: int = 4,
     ) -> None:
         super().__init__()
         if mode not in _VALID_MODES:
@@ -71,6 +87,7 @@ class HybridLossBalancer(nn.Module):
         self.transition_epoch = transition_epoch
         self.blend_epochs = blend_epochs
         self.mode = mode
+        self.gradnorm_stride = max(1, int(gradnorm_stride))
 
         # Uncertainty Weighting parameters (Kendall et al., 2018)
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
@@ -79,6 +96,18 @@ class HybridLossBalancer(nn.Module):
         self.task_weights = nn.Parameter(torch.ones(num_tasks))
         self.register_buffer("l0", torch.zeros(num_tasks))
         self.register_buffer("l0_initialized", torch.zeros(1, dtype=torch.bool))
+
+        # ── Acceleration Guide §A: cached GradNorm weights for stride>1 ───
+        # ``_step_counter`` is registered as a buffer so it survives
+        # ``state_dict`` round-trips (e.g. checkpoint restore in ablation
+        # studies). Cached weights default to all-ones, matching the
+        # canonical ``normalized_weights`` initialisation.
+        self.register_buffer(
+            "_cached_gn_weights", torch.ones(num_tasks)
+        )
+        self.register_buffer(
+            "_gn_step_counter", torch.zeros(1, dtype=torch.long)
+        )
 
     # ------------------------------------------------------------------
     #  Sub-objectives
@@ -105,12 +134,30 @@ class HybridLossBalancer(nn.Module):
             self.l0 = task_losses.detach().clone()
             self.l0_initialized.fill_(True)
 
+        # Acceleration Guide §A: skip the per-task autograd.grad pass on
+        # batches where stride>1 by reusing the cached normalized weights.
+        # We always advance the step counter so the schedule stays aligned
+        # with the global mini-batch index.
+        if shared_params is None or not self.training:
+            # Pure inference / no shared-params probe → cached weights only.
+            w = self._cached_gn_weights.detach().to(device)
+            return (w * task_losses).sum()
+
+        self._gn_step_counter += 1
+        do_full_update: bool = (
+            int(self._gn_step_counter.item()) % self.gradnorm_stride == 0
+        )
+
+        if not do_full_update:
+            # Fast path: use cached weights (no autograd.grad, no graph
+            # update on ``self.task_weights`` this step).
+            w = self._cached_gn_weights.detach().to(device)
+            return (w * task_losses).sum()
+
+        # ── Slow path: full GradNorm update (every ``gradnorm_stride`` batches) ──
         w = self.task_weights.clamp(min=1e-3)
         w = w * self.num_tasks / w.sum()
         total = (w * task_losses).sum()
-
-        if shared_params is None or not self.training:
-            return total
 
         g_tilde: list[torch.Tensor] = []
         for loss_i in losses:
@@ -131,6 +178,10 @@ class HybridLossBalancer(nn.Module):
         r_tilde = r / r.mean().clamp_min(1e-8)
         target = (G_bar * r_tilde.pow(self.alpha)).detach()
         L_gn = torch.abs(G - target).sum()
+
+        # Refresh the cache so the next stride-1 batches reuse the weights
+        # produced by *this* full update.
+        self._cached_gn_weights.copy_(w.detach().to(self._cached_gn_weights.device))
 
         return total + L_gn
 

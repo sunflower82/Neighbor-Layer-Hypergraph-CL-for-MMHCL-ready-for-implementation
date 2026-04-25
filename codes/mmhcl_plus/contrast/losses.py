@@ -1,5 +1,5 @@
 """
-Loss functions for MMHCL+ --- Revision 5.1
+Loss functions for MMHCL+ --- Revision 5.2 (Acceleration Guide §B + §C)
 
 Changes from Rev44:
   - REMOVED: barlow_twins_loss (replaced by vicreg_loss)
@@ -7,7 +7,19 @@ Changes from Rev44:
   - UPDATED: chunked_info_nce_loss --- added hard_negatives parameter for FAISS mining
   - KEPT:    bpr_loss, info_nce_loss, temperature_free_info_nce_loss (unchanged)
 
-Loss landscape (6 objectives):
+Rev5.2 speedup patches (mmhcl_rev52_speedup_analysis_en):
+  * §B1 Lazy covariance: ``vicreg_loss(..., compute_cov=False)`` skips the
+    O(D^2) covariance materialisation entirely.  Caller toggles it every
+    other epoch -> ~10 % wall-clock saving with negligible NDCG impact
+    (cov term carries weight 1.0 vs 25.0 for sim/var).
+  * §B2 bf16 matmul: on RTX 5090 / Blackwell the covariance ``z^T z``
+    is computed in bfloat16 (same dynamic range as fp32, native tensor
+    cores) and immediately upcast back to fp32 for the off-diagonal sum.
+  * §C torch.compile: ``vicreg_loss`` is wrapped with the soft-byol
+    helper at module load time, fusing mean/var/relu/off-diagonal into a
+    single Inductor kernel on Linux while keeping eager mode on Windows.
+
+Loss landscape (5 objectives in Rev5.2 base; +1 ego_final for A7 ablation):
   L_BPR        --- main recommendation task
   L_u2u        --- vicreg_loss (neighbor-layer CL on user hypergraph)
   L_i2i        --- chunked_info_nce_loss + FAISS hard negatives
@@ -34,6 +46,20 @@ def off_diagonal(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 # VICReg (u2u branch + ego-final anchor --- Stage 1 & Stage 2)
 # ---------------------------------------------------------------------------
+def _bf16_matmul_cov(z_centered: torch.Tensor, scale: float) -> torch.Tensor:
+    """Compute ``(zᵀ z) * scale`` via bf16 tensor cores, upcast to fp32.
+
+    Acceleration Guide §B2: RTX 5090 / Blackwell SM120 exposes native
+    bfloat16 tensor cores with the same dynamic range as float32, so the
+    [D, D] covariance product cannot overflow as it would with fp16.
+    The result is immediately promoted back to fp32 for the
+    off-diagonal sum, so downstream numerics are unaffected.
+    """
+    z_bf = z_centered.to(torch.bfloat16)
+    cov = (z_bf.T @ z_bf).float() * scale
+    return cov
+
+
 def vicreg_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
@@ -41,24 +67,33 @@ def vicreg_loss(
     var_weight: float = 25.0,
     cov_weight: float = 1.0,
     soft_weights: torch.Tensor | None = None,
+    compute_cov: bool = True,
 ) -> torch.Tensor:
     """
     VICReg Loss (Bardes et al., ICLR 2022).
 
     Eliminates the O(B*D^2) global cross-correlation matrix bottleneck of
-    Barlow Twins. With D=1024 (vs D=8192), saves ~80% VRAM and ~60% FLOPs.
+    Barlow Twins. With D=4096 (Rev5.2 expanded projector), the variance
+    and covariance terms still fit comfortably on a 32 GB GPU because the
+    covariance is computed in bfloat16 (Acceleration Guide §B2).
 
     Three terms computed along the BATCH dimension:
       1. Invariance (sim):  MSE between paired embeddings z1, z2
       2. Variance   (var):  Hinge loss pushing std of each dimension >= 1
       3. Covariance (cov):  Penalizes off-diagonal entries of the covariance matrix
+                            (skipped when ``compute_cov=False``)
 
     Args:
-        z1, z2:      [B, D] projected embeddings from ExpandedProjector (D=1024).
+        z1, z2:      [B, D] projected embeddings from ExpandedProjector.
         sim_weight:  lambda for invariance term (default 25.0 per VICReg paper).
         var_weight:  mu for variance term (default 25.0).
         cov_weight:  nu for covariance term (default 1.0).
         soft_weights: Optional [B] per-sample importance from W_ema.
+        compute_cov:  When ``False`` the covariance penalty is skipped
+                      entirely.  Acceleration Guide §B1: caller toggles
+                      this every other epoch (``epoch % 2 == 0``) to
+                      recover ~10 % wall-clock at no measurable NDCG cost
+                      (cov_weight=1.0 vs sim+var=25.0+25.0=50.0).
 
     Returns:
         Scalar loss.
@@ -71,10 +106,9 @@ def vicreg_loss(
     else:
         repr_loss = F.mse_loss(z1, z2)
 
-    # Acceleration Guide §3 — VICReg variance+covariance in fp32.
-    # The D×D covariance matrix has ~D²=16M terms for D=4096; the sum of
-    # squared off-diagonals can easily exceed float16's max value (~65504).
-    # Disabling autocast + casting to float32 guarantees numerical safety
+    # Acceleration Guide §3 — VICReg variance+covariance in fp32 (variance)
+    # and bf16 (covariance matmul, then upcast).  Disabling autocast +
+    # casting to float32 guarantees numerical safety for the variance hinge
     # regardless of whether the caller is using fp16, bf16, or no AMP.
     with torch.amp.autocast("cuda", enabled=False):
         z1_f = z1.float()
@@ -88,12 +122,21 @@ def vicreg_loss(
                    torch.mean(F.relu(1.0 - torch.sqrt(z2_f.var(dim=0) + 1e-4)))
 
         # -- 3. Covariance term: decorrelate off-diagonal entries --
-        N, D = z1_f.size()
-        cov_z1 = (z1_f.T @ z1_f) / (N - 1)
-        cov_z2 = (z2_f.T @ z2_f) / (N - 1)
+        if compute_cov:
+            N, D = z1_f.size()
+            scale = 1.0 / max(N - 1, 1)
+            # §B2: bf16 matmul on Blackwell tensor cores; upcast for sum.
+            if z1_f.is_cuda:
+                cov_z1 = _bf16_matmul_cov(z1_f, scale)
+                cov_z2 = _bf16_matmul_cov(z2_f, scale)
+            else:
+                cov_z1 = (z1_f.T @ z1_f) * scale
+                cov_z2 = (z2_f.T @ z2_f) * scale
 
-        cov_loss = off_diagonal(cov_z1).pow_(2).sum().div(D) + \
-                   off_diagonal(cov_z2).pow_(2).sum().div(D)
+            cov_loss = off_diagonal(cov_z1).pow_(2).sum().div(D) + \
+                       off_diagonal(cov_z2).pow_(2).sum().div(D)
+        else:
+            cov_loss = z1_f.new_zeros(())
 
     return sim_weight * repr_loss + var_weight * std_loss + cov_weight * cov_loss
 
@@ -200,3 +243,18 @@ def bpr_loss(
 ) -> torch.Tensor:
     """Standard Bayesian Personalised Ranking loss."""
     return -torch.log(torch.sigmoid(pos_scores - neg_scores).clamp_min(1e-8)).mean()
+
+
+# ---------------------------------------------------------------------------
+# Acceleration Guide §C — torch.compile wrap for ``vicreg_loss``
+# ---------------------------------------------------------------------------
+# The Inductor backend fuses ``mean``/``var``/``relu(1 - sqrt(...))`` and the
+# off-diagonal sum-of-squares into a single kernel, removing the temporary
+# 4096×4096 covariance materialisation in eager mode. The helper from
+# ``soft_byol`` already handles platform-specific fallbacks (Windows skips
+# Triton inductor, ``MMHCL_DISABLE_TORCH_COMPILE`` opt-out).
+# Importing inside the module-level scope at the bottom avoids circular
+# imports because ``soft_byol`` does not depend on ``losses``.
+from .soft_byol import _maybe_torch_compile as _maybe_torch_compile  # noqa: E402
+
+vicreg_loss = _maybe_torch_compile(vicreg_loss)

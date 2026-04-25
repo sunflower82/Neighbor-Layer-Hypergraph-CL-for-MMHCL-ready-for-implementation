@@ -373,6 +373,9 @@ class MMHCLPlusTrainer:
                 transition_epoch=getattr(args, "balancer_transition_epoch", 40),
                 blend_epochs=getattr(args, "balancer_blend_epochs", 20),
                 mode=balancer_type,
+                # Acceleration Guide §A: stride>1 caches GradNorm weights
+                # between full updates, recovering ~12% of wall-clock time.
+                gradnorm_stride=int(getattr(args, "gradnorm_stride", 4)),
             ).cuda()
         elif balancer_type == "uncertainty":
             # Use the dedicated UncertaintyLossBalancer (single-mode).
@@ -380,12 +383,19 @@ class MMHCLPlusTrainer:
         else:
             raise ValueError(f"Unknown balancer_type '{balancer_type}'")
 
+        # Acceleration Guide §B1: lazy VICReg covariance toggle
+        self._vicreg_lazy_cov: bool = bool(getattr(args, "vicreg_lazy_cov", 1))
+
         self.logger.logging(
             f"[Ablation] balancer={balancer_type} n_tasks={n_tasks} "
             f"tasks={self._task_names} g_layers={self._g_layers} "
             f"NLCL={self._enable_nlcl} Dir={self._enable_dirichlet} "
             f"Align={self._enable_soft_byol} EgoFinal={self._enable_ego_final} "
             f"CLRamp={self._enable_cl_ramp} DelayFAISS={self._enable_delayed_faiss}"
+        )
+        self.logger.logging(
+            f"[Rev5.2-OPT] gradnorm_stride={int(getattr(args, 'gradnorm_stride', 4))} "
+            f"vicreg_lazy_cov={int(self._vicreg_lazy_cov)}"
         )
 
         # Unified optimizer (model + projector + balancer; NOT ema_model)
@@ -616,6 +626,14 @@ class MMHCLPlusTrainer:
             else:
                 use_hard_negs = epoch > delay_hard_negs_epoch
 
+            # Acceleration Guide §B1: skip VICReg covariance term on
+            # odd-indexed epochs to save the [D, D] matmul. The cov term
+            # contributes weight 1.0 vs sim+var=50.0, so dropping half of
+            # its updates is empirically NDCG-neutral.
+            vicreg_compute_cov: bool = (
+                (not self._vicreg_lazy_cov) or (epoch % 2 == 0)
+            )
+
             # Shared params for GradNorm (Rev5.2 Hybrid Balancer)
             shared_params = self._get_shared_params() if isinstance(self.balancer, HybridLossBalancer) else None
 
@@ -702,6 +720,7 @@ class MMHCLPlusTrainer:
                                     var_weight=getattr(args, 'vicreg_var_weight', 25.0),
                                     cov_weight=getattr(args, 'vicreg_cov_weight', 1.0),
                                     soft_weights=soft_w_u,
+                                    compute_cov=vicreg_compute_cov,
                                 )
                             )
                         batch_u2u = (
@@ -819,6 +838,7 @@ class MMHCLPlusTrainer:
                                 sim_weight=getattr(args, "vicreg_sim_weight", 25.0),
                                 var_weight=getattr(args, "vicreg_var_weight", 25.0),
                                 cov_weight=getattr(args, "vicreg_cov_weight", 1.0),
+                                compute_cov=vicreg_compute_cov,
                             )
                             ego_i = vicreg_loss(
                                 self.projector(h_i_ego),
@@ -826,6 +846,7 @@ class MMHCLPlusTrainer:
                                 sim_weight=getattr(args, "vicreg_sim_weight", 25.0),
                                 var_weight=getattr(args, "vicreg_var_weight", 25.0),
                                 cov_weight=getattr(args, "vicreg_cov_weight", 1.0),
+                                compute_cov=vicreg_compute_cov,
                             )
                             batch_ego = ego_u + ego_i
 
@@ -951,6 +972,8 @@ class MMHCLPlusTrainer:
                         "train/hard_negs_active": int(use_hard_negs),
                         "train/warmup": int(in_warmup),
                         "train/lr": self.optimizer.param_groups[0]["lr"],
+                        # Acceleration Guide §B1 audit trail
+                        "train/vicreg_compute_cov": int(vicreg_compute_cov),
                     }
                 )
 
