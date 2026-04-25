@@ -65,7 +65,7 @@ def _maybe_torch_compile(fn):
         logger.warning(msg)
         return fn
     try:
-        return compile_fn(fn, dynamic=True, fullgraph=False)
+        compiled = compile_fn(fn, dynamic=True, fullgraph=False)
     except Exception as exc:  # noqa: BLE001 - report any compile failure
         msg = (
             f"[soft_byol] torch.compile failed ({type(exc).__name__}: {exc}); "
@@ -74,6 +74,40 @@ def _maybe_torch_compile(fn):
         warnings.warn(msg, RuntimeWarning, stacklevel=2)
         logger.warning(msg)
         return fn
+
+    # ── Belt-and-suspenders: catch FIRST-CALL Inductor failures ──────────────
+    # ``torch.compile`` defers actual codegen + C++ build until the first
+    # invocation, so decoration-time try/except above does NOT catch the
+    # ``CppCompileError`` raised when MSVC ``cl.exe`` chokes on a temp path
+    # containing a space (e.g. ``torchinductor_Anh Khoi``).  Wrap the compiled
+    # callable so that the first runtime failure permanently degrades to eager
+    # for the remainder of the run; subsequent calls bypass the failed compile.
+    _state: dict[str, bool] = {"degraded": False}
+
+    def _resilient(*args, **kwargs):
+        if _state["degraded"]:
+            return fn(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - record any compile/runtime failure
+            _state["degraded"] = True
+            short = str(exc)
+            if len(short) > 240:
+                short = short[:240] + "..."
+            msg = (
+                f"[soft_byol] torch.compile runtime failure for {fn.__name__} "
+                f"({type(exc).__name__}: {short}); falling back to eager for "
+                f"the remainder of the run."
+            )
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            logger.warning(msg)
+            return fn(*args, **kwargs)
+
+    _resilient.__name__ = fn.__name__
+    _resilient.__qualname__ = getattr(fn, "__qualname__", fn.__name__)
+    _resilient.__doc__ = fn.__doc__
+    _resilient.__wrapped__ = fn  # type: ignore[attr-defined]
+    return _resilient
 
 
 def _soft_byol_alignment_impl(

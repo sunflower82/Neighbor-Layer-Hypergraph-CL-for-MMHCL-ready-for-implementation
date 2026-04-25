@@ -46,6 +46,65 @@ import pathlib
 from time import time
 from typing import Any
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Rev5.2-OPT — Windows torch._inductor cache-dir hardening
+# ─────────────────────────────────────────────────────────────────────────────
+# torch._inductor builds its on-disk JIT cache under
+# ``<TMP>/torchinductor_<getpass.getuser()>/...`` and then passes the resulting
+# path **unquoted** to ``cl.exe``.  When the Windows account name contains a
+# space (e.g. "Anh Khoi"), MSVC splits the command line on whitespace, mistakes
+# the trailing token ``Khoi/zg/...main.cpp`` for a separate source file, and
+# raises:
+#     fatal error C1083: Cannot open source file '...main.cpp'
+# This crashes the first call to a compiled function (e.g. ``vicreg_loss`` at
+# the end of CL warmup) with ``InductorError: CppCompileError``.
+#
+# Pre-empt this by redirecting the inductor cache to a space-free directory
+# **before** any ``torch.compile``-wrapped function executes.  Inductor reads
+# ``TORCHINDUCTOR_CACHE_DIR`` lazily on first compile, so setting it here (even
+# after ``import torch`` further down) is sufficient.
+def _harden_torchinductor_cache_dir() -> None:
+    if os.environ.get("TORCHINDUCTOR_CACHE_DIR"):
+        return  # honour explicit user/CI override
+    if os.name != "nt":
+        return  # Windows-only quirk
+    import getpass
+    try:
+        username = getpass.getuser()
+    except Exception:
+        return
+    if " " not in username:
+        return  # default cache location is safe
+    candidates = [
+        r"C:\torchinductor_cache",
+        r"D:\torchinductor_cache",
+    ]
+    for cand in candidates:
+        try:
+            os.makedirs(cand, exist_ok=True)
+            if " " in os.path.abspath(cand):
+                continue
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cand
+            print(
+                f"[Rev5.2-OPT] TORCHINDUCTOR_CACHE_DIR={cand} "
+                f"(Windows username '{username}' contains a space; redirecting "
+                f"to avoid the cl.exe path-splitting bug)"
+            )
+            return
+        except OSError:
+            continue
+    os.environ.setdefault("MMHCL_DISABLE_TORCH_COMPILE", "1")
+    print(
+        "[Rev5.2-OPT] WARNING: could not create a space-free torchinductor "
+        "cache dir; setting MMHCL_DISABLE_TORCH_COMPILE=1 as a safety fallback."
+    )
+
+
+_harden_torchinductor_cache_dir()
+del _harden_torchinductor_cache_dir
+
+
 from Models import MMHCL
 
 # ── third-party ───────────────────────────────────────────────────────────────
