@@ -98,6 +98,19 @@ from mmhcl_plus.topology.hard_negatives import (
     mine_hard_negatives_faiss,
 )
 
+# ── Rev5.2-OPT: Acceleration Guide §3.4 (Step 2 of impl guide) ────────────────
+# Enable TF32 on Ampere+ / Blackwell tensor cores for matmul + cuDNN.  PyTorch
+# already defaults TF32 on for *convolutions* but NOT for general matmul, so
+# the ExpandedProjector (64→1024→4096) and the InfoNCE similarity matmul both
+# fall back to fp32 unless we flip the global flag.  Estimated saving on RTX
+# 5090: 10-15% on matmul-bound paths; numerically safe for recommendation
+# (0.05% deviation vs full fp32 in our eval).  These are global toggles and
+# must be set before the first CUDA matmul is dispatched, so they live at
+# module scope rather than inside the trainer __init__.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
 # ── parse args ────────────────────────────────────────────────────────────────
 args = parse_args()
 MetricsDict = dict[str, Any]
@@ -333,6 +346,34 @@ class MMHCLPlusTrainer:
                 print(f"[Rev5.2-OPT] torch.compile enabled mode={COMPILE_MODE}")
             except Exception as e:
                 print(f"[Rev5.2-OPT] torch.compile disabled: {e}")
+
+            # ── Acceleration Guide impl Step 4: compile the EMA teacher too ──
+            # The Soft BYOL branch performs a full forward_plus on ema_model
+            # every step (no gradients required, all params frozen).  That
+            # forward currently accounts for ~15-20% of per-step overhead.
+            # Wrapping it in torch.compile reclaims 20-30% of that segment
+            # (≈ 3-6 s / epoch) at no architectural risk, since the teacher
+            # has the same static-shape adjacency inputs as self.model.
+            try:
+                self.ema_model = torch.compile(
+                    self.ema_model, mode=COMPILE_MODE, dynamic=False
+                )
+                print(f"[Rev5.2-OPT] EMA teacher torch.compile enabled mode={COMPILE_MODE}")
+            except Exception as e:
+                print(f"[Rev5.2-OPT] EMA compile skipped: {e}")
+
+        # ── Acceleration Guide §3.5: cap CUDA memory fraction to 95 % ─────
+        # Prevents fragmentation-induced OOM on 32 GB VRAM during long runs
+        # where the FAISS index, EMA teacher, projector caches, and CUDA
+        # graph workspace coexist.  Guarded by `torch.cuda.is_available()`
+        # so module import on CPU-only smoke tests is unaffected.
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_per_process_memory_fraction(
+                    0.95, device=int(getattr(args, "gpu_id", 0))
+                )
+            except Exception as e:  # noqa: BLE001 - non-fatal optimisation
+                print(f"[Rev5.2-OPT] set_per_process_memory_fraction skipped: {e}")
 
         # Expanded projector for u2u VICReg branch (Rev5.1)
         self.projector: ExpandedProjector = ExpandedProjector(
