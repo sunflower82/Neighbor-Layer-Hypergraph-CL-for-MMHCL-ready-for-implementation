@@ -196,7 +196,19 @@ class Data:
         return _sparse_mx_to_torch(sparse_mx)
 
     def print_statistics(self) -> None:
-        """Print basic dataset statistics to the console."""
+        """Print basic dataset statistics to the console.
+
+        Only emits output from the main process. When ``utility.batch_test`` is
+        re-imported by a multiprocessing worker (e.g. ``Pool`` on Windows uses
+        the ``spawn`` start method), the global ``data_generator = Data(...)``
+        is rebuilt in every worker — without this guard each worker would
+        race-print the same 3 stats lines to the parent's stdout pipe,
+        producing the interleaved ``n_users=...n_train=...`` flood seen
+        during evaluation epochs.
+        """
+        import multiprocessing as _mp
+        if _mp.current_process().name != "MainProcess":
+            return
         print(f"n_users={self.n_users}, n_items={self.n_items}")
         print(f"n_interactions={self.n_train + self.n_test}")
         sparsity = (self.n_train + self.n_test) / (self.n_users * self.n_items)

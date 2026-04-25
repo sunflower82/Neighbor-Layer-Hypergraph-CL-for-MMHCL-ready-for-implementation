@@ -246,6 +246,42 @@ def test_one_user(x: tuple[npt.NDArray[np.floating], int, bool]) -> MetricsDict:
 
 
 # ===========================================================================
+#  Persistent multiprocessing.Pool (Rev5.2-OPT)
+# ===========================================================================
+# Spawning a fresh ``Pool(cores)`` on every ``test_torch`` call is expensive
+# on Windows: ``spawn`` re-imports this module → reconstructs ``Data(...)`` in
+# every worker → re-loads the dataset from disk for each evaluation. We
+# instead construct the pool lazily once and reuse it across calls. An
+# ``atexit`` hook guarantees clean shutdown to avoid orphaned workers.
+_GLOBAL_POOL: "multiprocessing.pool.Pool | None" = None
+
+
+def _get_pool() -> "multiprocessing.pool.Pool":
+    """Return a process-wide ``multiprocessing.Pool`` (lazy singleton)."""
+    global _GLOBAL_POOL
+    if _GLOBAL_POOL is None:
+        _GLOBAL_POOL = multiprocessing.Pool(cores)
+    return _GLOBAL_POOL
+
+
+def _shutdown_pool() -> None:
+    """Best-effort shutdown of the persistent worker pool at interpreter exit."""
+    global _GLOBAL_POOL
+    if _GLOBAL_POOL is not None:
+        try:
+            _GLOBAL_POOL.close()
+            _GLOBAL_POOL.join()
+        except Exception:
+            pass
+        finally:
+            _GLOBAL_POOL = None
+
+
+import atexit as _atexit
+_atexit.register(_shutdown_pool)
+
+
+# ===========================================================================
 #  Main Evaluation Function
 # ===========================================================================
 def test_torch(
@@ -280,7 +316,7 @@ def test_torch(
         "hit_ratio": np.zeros(len(Ks)),
         "auc": 0.0,
     }
-    pool: multiprocessing.pool.Pool = multiprocessing.Pool(cores)
+    pool: multiprocessing.pool.Pool = _get_pool()
 
     # Use 2× batch_size for user batches (scoring is cheaper than training)
     u_batch_size: int = BATCH_SIZE * 2
@@ -350,5 +386,6 @@ def test_torch(
             result["auc"] += re["auc"] / n_test_users
 
     assert count == n_test_users
-    pool.close()
+    # NOTE: Do NOT close the pool here — it is reused across evaluations.
+    # Cleanup is handled by the atexit handler at interpreter shutdown.
     return result
