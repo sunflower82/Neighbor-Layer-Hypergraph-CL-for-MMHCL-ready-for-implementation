@@ -427,6 +427,47 @@ def _batch_jaccard(neighbor_sets: torch.Tensor, n_nodes: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _wema_cache_key(
+    feat_paths: list[str],
+    n_nodes: int,
+    alpha: float,
+    update_interval: int,
+    percentile: float,
+    purification_temp: float,
+    ann_k: int,
+    side: str,
+) -> str:
+    """
+    Build a deterministic cache filename from hyperparameters and feature
+    file fingerprints. mtime+size hash is sufficient — no need to read bytes.
+    """
+    import hashlib
+    import os
+
+    h = hashlib.sha1()
+    for fp in feat_paths:
+        if not os.path.exists(fp):
+            continue
+        st = os.stat(fp)
+        h.update(f"{fp}|{st.st_size}|{int(st.st_mtime)}".encode())
+    h.update(f"|n={n_nodes}|a={alpha}|i={update_interval}".encode())
+    h.update(f"|p={percentile}|t={purification_temp}|k={ann_k}".encode())
+    fp_hash = h.hexdigest()[:10]
+    return (
+        f"wema_{side}_a{alpha}_int{update_interval}_p{percentile}"
+        f"_t{purification_temp}_k{ann_k}_n{n_nodes}_{fp_hash}.pth"
+    )
+
+
+def _wema_cache_dir(feat_paths: list[str]) -> str:
+    """Cache directory = parent of feature files (e.g. data/<dataset>/)."""
+    import os
+
+    if feat_paths:
+        return os.path.dirname(feat_paths[0]) or "."
+    return "."
+
+
 def build_item_wema(
     n_items: int,
     item_feat_paths: list[str],
@@ -442,11 +483,43 @@ def build_item_wema(
     """
     Build and initialise a WEMAManager for the item side.
 
+    P2 (Acceleration Guide): cache the assembled manager to disk so subsequent
+    runs skip the ~30-60s setup (np.load → cosine sim → kNN → soft topology).
+    Cache invalidates automatically if any hyperparameter, n_items or feature
+    file (mtime/size) changes.
+
     Returns None if no feature files are found.
     """
     import os
 
     import numpy as np
+
+    cache_dir = _wema_cache_dir(item_feat_paths)
+    cache_name = _wema_cache_key(
+        item_feat_paths,
+        n_items,
+        alpha,
+        update_interval,
+        percentile,
+        purification_temp,
+        ann_k,
+        side="item",
+    )
+    cache_path = os.path.join(cache_dir, cache_name)
+
+    if os.path.exists(cache_path):
+        try:
+            mgr = torch.load(cache_path, weights_only=False, map_location="cpu")
+            if logger:
+                logger.logging(
+                    f"[WEMAManager] cache HIT: {cache_name}  (n_items={n_items})"
+                )
+            return mgr
+        except Exception as exc:
+            if logger:
+                logger.logging(
+                    f"[WEMAManager] cache load failed ({exc}); rebuilding."
+                )
 
     raw_feats: list[torch.Tensor] = []
     for fp in item_feat_paths:
@@ -482,6 +555,14 @@ def build_item_wema(
             f"alpha={alpha:.2f}, update_interval={update_interval}, "
             f"purification_percentile={percentile:.2f}"
         )
+    # Save cache (ignore IO errors — caching is best-effort)
+    try:
+        torch.save(mgr, cache_path)
+        if logger:
+            logger.logging(f"[WEMAManager] cache MISS → saved: {cache_name}")
+    except Exception as exc:
+        if logger:
+            logger.logging(f"[WEMAManager] cache save failed ({exc}); continuing.")
     return mgr
 
 
@@ -505,11 +586,51 @@ def build_user_wema(
     User features are derived by mean-pooling item features over each user's
     training interactions (NLGCL+ Eq. 10).
 
+    P2: cached to disk; key includes train_items hash so user re-mapping
+    invalidates the cache automatically.
+
     Returns None if no feature files are found.
     """
+    import hashlib
     import os
 
     import numpy as np
+
+    cache_dir = _wema_cache_dir(item_feat_paths)
+    # Hash train_items shape (pos count per user) — picks up any orphan-remap
+    # without paying for full content hash. (n_users, n_items) already in key.
+    h = hashlib.sha1()
+    h.update(f"users={n_users}|items={n_items}".encode())
+    for uid in sorted(train_items.keys()):
+        h.update(f"{uid}:{len(train_items[uid])};".encode())
+    train_hash = h.hexdigest()[:8]
+    base = _wema_cache_key(
+        item_feat_paths,
+        n_users,
+        alpha,
+        update_interval,
+        percentile,
+        purification_temp,
+        ann_k,
+        side="user",
+    )
+    cache_name = base.replace(".pth", f"_tr{train_hash}.pth")
+    cache_path = os.path.join(cache_dir, cache_name)
+
+    if os.path.exists(cache_path):
+        try:
+            mgr = torch.load(cache_path, weights_only=False, map_location="cpu")
+            if logger:
+                logger.logging(
+                    f"[WEMAManager-user] cache HIT: {cache_name}  "
+                    f"(n_users={n_users})"
+                )
+            return mgr
+        except Exception as exc:
+            if logger:
+                logger.logging(
+                    f"[WEMAManager-user] cache load failed ({exc}); rebuilding."
+                )
 
     item_feat_list: list[torch.Tensor] = []
     for fp in item_feat_paths:
@@ -549,4 +670,13 @@ def build_user_wema(
             f"[WEMAManager-user] User W_ema ready: {n_users} users, alpha={alpha:.2f}, "
             f"update_interval={update_interval}, purification_percentile={percentile:.2f}"
         )
+    try:
+        torch.save(mgr, cache_path)
+        if logger:
+            logger.logging(f"[WEMAManager-user] cache MISS → saved: {cache_name}")
+    except Exception as exc:
+        if logger:
+            logger.logging(
+                f"[WEMAManager-user] cache save failed ({exc}); continuing."
+            )
     return mgr

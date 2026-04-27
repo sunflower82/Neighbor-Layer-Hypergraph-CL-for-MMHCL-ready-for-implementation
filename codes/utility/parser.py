@@ -630,6 +630,30 @@ def parse_args() -> argparse.Namespace:
         "essentially flat. Set to 0 to compute the covariance every epoch.",
     )
 
+    parser.add_argument(
+        "--async_prefetch",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help=(
+            "MMHCL+ Rev5.2 Acceleration Guide §P6 — overlap BPR sampling with "
+            "GPU forward+backward via a background daemon thread. Defaults to "
+            "1 (enabled). Set to 0 to disable (synchronous sampling). Can also "
+            "be disabled via env var MMHCL_ASYNC_PREFETCH=0 for ad-hoc debug."
+        ),
+    )
+    parser.add_argument(
+        "--async_prefetch_depth",
+        type=int,
+        default=2,
+        help=(
+            "MMHCL+ Rev5.2 Acceleration Guide §P6 — number of pre-built BPR "
+            "batches in the prefetch queue. 2 is enough to fully hide CPU "
+            "latency on RTX 5090; 3-4 may help on slower CPUs but uses more "
+            "RAM."
+        ),
+    )
+
     # =====================================================================
     #  MMHCL+ Rev5.2 Ablation Study (see mmhcl_plus/ablation/ablation_config.py)
     # =====================================================================

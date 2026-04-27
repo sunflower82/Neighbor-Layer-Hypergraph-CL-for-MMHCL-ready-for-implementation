@@ -746,14 +746,27 @@ class MMHCLPlusTrainer:
             dir_acc = 0.0
             n_batch: int = data_generator.n_train // args.batch_size + 1
 
+            # P6 (Acceleration Guide): wrap data_generator in a background-thread
+            # prefetcher exactly once. The sampler is created on the first epoch
+            # and reused for the entire training run.
+            if not hasattr(self, "_bpr_sampler"):
+                from utility.load_data import AsyncBPRSampler
+                _async_flag = bool(getattr(args, "async_prefetch", 1))
+                self._bpr_sampler = AsyncBPRSampler(
+                    data_generator,
+                    prefetch=int(getattr(args, "async_prefetch_depth", 2)),
+                    async_prefetch=_async_flag,
+                    logger=getattr(self, "logger", None),
+                ).start()
+
             # ── Mini-batch loop ──────────────────────────────────────────────
             for _ in range(n_batch):
                 self.model.train()
                 self.projector.train()
                 self.optimizer.zero_grad(set_to_none=True)
 
-                # BPR sampling
-                users, pos_items, neg_items = data_generator.sample()
+                # BPR sampling (P6: prefetched in background thread)
+                users, pos_items, neg_items = self._bpr_sampler.sample()
 
                 # ── AMP autocast: wraps forward + loss (NOT backward) ────────
                 # Acceleration Guide §3 — dtype configurable via MMHCL_AMP_DTYPE.
